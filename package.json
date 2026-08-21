@@ -1,0 +1,13 @@
+{
+  "name": "secure-messenger",
+  "private": true,
+  "scripts": {
+    "dev:backend": "uv run --project backend uvicorn app.main:app --reload --app-dir backend",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "migrate": "uv run --project backend alembic -c backend/alembic.ini upgrade head",
+    "test:backend": "uv run --project backend pytest backend/tests",
+    "test:frontend": "npm --prefix frontend run build",
+    "test": "npm run test:backend && npm run test:frontend"
+  }
+}
+
