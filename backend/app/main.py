@@ -6,6 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.router import router as auth_router
 from app.config import get_settings
 from app.database import get_session
 
@@ -15,9 +16,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[str(settings.frontend_origin).rstrip("/")],
     allow_credentials=True,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+app.include_router(auth_router)
 
 
 @app.get("/health")
@@ -30,4 +32,3 @@ async def health(session: Annotated[AsyncSession, Depends(get_session)]) -> dict
             detail="database unavailable",
         ) from exc
     return {"status": "ok", "database": "ok"}
-
