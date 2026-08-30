@@ -1,0 +1,471 @@
+:root {
+  color: #17201d;
+  background: #f1f5f2;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button, input { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: 0.65; }
+
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid rgb(32 129 95 / 30%);
+  outline-offset: 2px;
+}
+
+.auth-page,
+.loading-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px 20px;
+  background:
+    radial-gradient(circle at 12% 15%, rgb(126 211 172 / 24%), transparent 28rem),
+    radial-gradient(circle at 90% 85%, rgb(115 159 202 / 20%), transparent 30rem),
+    #f5f8f6;
+}
+
+.loading-page {
+  align-content: center;
+  gap: 12px;
+  color: #52625c;
+}
+
+.brand-mark {
+  display: grid;
+  width: 52px;
+  height: 52px;
+  margin: 0 auto 18px;
+  place-items: center;
+  border-radius: 16px;
+  color: #fff;
+  background: linear-gradient(140deg, #116c50, #238c68);
+  box-shadow: 0 10px 26px rgb(17 108 80 / 25%);
+  font-size: 24px;
+  font-weight: 800;
+}
+
+.brand-mark.small {
+  width: 38px;
+  height: 38px;
+  margin: 0;
+  border-radius: 11px;
+  font-size: 18px;
+}
+
+.auth-card {
+  width: min(100%, 430px);
+  padding: 38px;
+  border: 1px solid #dfe7e2;
+  border-radius: 24px;
+  background: rgb(255 255 255 / 94%);
+  box-shadow: 0 24px 70px rgb(32 57 48 / 12%);
+}
+
+.eyebrow {
+  margin: 0 0 7px;
+  color: #467163;
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.auth-card > .eyebrow,
+.auth-card > h1,
+.auth-intro { text-align: center; }
+
+h1, h2 {
+  margin: 0;
+  color: #17201d;
+  letter-spacing: -0.03em;
+}
+
+.auth-card h1 { font-size: 30px; }
+
+.auth-intro,
+.section-description {
+  color: #64716c;
+  line-height: 1.55;
+}
+
+.auth-intro { margin: 10px 0 24px; }
+
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 24px;
+  padding: 4px;
+  border-radius: 12px;
+  background: #edf2ef;
+}
+
+.auth-tabs button {
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 9px;
+  color: #61706a;
+  background: transparent;
+  font-weight: 650;
+}
+
+.auth-tabs button.active {
+  color: #174c3c;
+  background: #fff;
+  box-shadow: 0 2px 8px rgb(34 60 51 / 10%);
+}
+
+form label {
+  display: block;
+  margin: 16px 0 7px;
+  color: #35433e;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+form input {
+  width: 100%;
+  height: 46px;
+  padding: 0 13px;
+  border: 1px solid #ccd8d2;
+  border-radius: 11px;
+  color: #17201d;
+  background: #fff;
+}
+
+form input:hover { border-color: #a8bbb2; }
+
+.primary-button,
+.secondary-button,
+.danger-button {
+  border-radius: 10px;
+  font-weight: 700;
+}
+
+.primary-button {
+  width: 100%;
+  margin-top: 20px;
+  padding: 13px 16px;
+  border: 0;
+  color: #fff;
+  background: #147456;
+  box-shadow: 0 7px 16px rgb(20 116 86 / 20%);
+}
+
+.primary-button:hover:not(:disabled) { background: #0e654a; }
+
+.form-error {
+  margin: 14px 0 0;
+  padding: 11px 13px;
+  border: 1px solid #f1c8c5;
+  border-radius: 10px;
+  color: #8d2922;
+  background: #fff3f2;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.device-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid #e7ece9;
+  color: #45534e;
+  font-size: 13px;
+}
+
+.device-note span:last-child,
+.brand-inline > div:last-child { display: grid; }
+
+.device-note small,
+.brand-inline small {
+  margin-top: 2px;
+  color: #7a8782;
+}
+
+.device-dot,
+.health-status > span {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #81908a;
+}
+
+.device-dot {
+  background: #2b9c74;
+  box-shadow: 0 0 0 4px #e5f5ee;
+}
+
+.health-status {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid #dbe4df;
+  border-radius: 999px;
+  color: #53625d;
+  background: rgb(255 255 255 / 85%);
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.health-status.online > span { background: #27a473; }
+.health-status.offline > span { background: #cf4a42; }
+
+.shell {
+  min-height: 100vh;
+  background: #f2f6f3;
+}
+
+.app-header {
+  display: flex;
+  min-height: 70px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 14px max(24px, calc((100vw - 1160px) / 2));
+  border-bottom: 1px solid #dce5e0;
+  background: rgb(255 255 255 / 94%);
+}
+
+.brand-inline,
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.health-status.inline {
+  position: static;
+  background: #f6f8f7;
+}
+
+.secondary-button,
+.danger-button {
+  padding: 9px 13px;
+  border: 1px solid #cfdad4;
+  color: #35433e;
+  background: #fff;
+}
+
+.secondary-button:hover:not(:disabled) { background: #f3f6f4; }
+
+.content-grid {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 24px;
+  width: min(1160px, calc(100% - 48px));
+  margin: 40px auto;
+}
+
+.profile-card,
+.devices-card {
+  border: 1px solid #dce5e0;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 10px 35px rgb(38 61 53 / 6%);
+}
+
+.profile-card {
+  align-self: start;
+  padding: 28px;
+}
+
+.avatar {
+  display: grid;
+  width: 68px;
+  height: 68px;
+  margin-bottom: 22px;
+  place-items: center;
+  border-radius: 20px;
+  color: #fff;
+  background: linear-gradient(145deg, #1a8060, #55a98a);
+  font-size: 27px;
+  font-weight: 800;
+}
+
+.profile-card h1 {
+  overflow-wrap: anywhere;
+  font-size: 26px;
+}
+
+.status-pill,
+.count-pill,
+.current-pill,
+.revoked-pill {
+  display: inline-block;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.status-pill {
+  margin-top: 10px;
+  padding: 5px 9px;
+  color: #176347;
+  background: #e6f5ee;
+  text-transform: capitalize;
+}
+
+.profile-card dl {
+  margin: 26px 0 0;
+  padding-top: 20px;
+  border-top: 1px solid #e8edea;
+}
+
+.profile-card dl > div + div { margin-top: 15px; }
+
+.profile-card dt {
+  margin-bottom: 3px;
+  color: #7b8883;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.profile-card dd {
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: #3c4944;
+  font-size: 13px;
+}
+
+.devices-card { padding: 30px; }
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.section-heading h2 { font-size: 25px; }
+
+.count-pill {
+  padding: 6px 10px;
+  color: #4a5a54;
+  background: #edf2ef;
+}
+
+.section-description {
+  margin: 10px 0 24px;
+  font-size: 14px;
+}
+
+.device-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.device-list li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 15px;
+  align-items: center;
+  padding: 18px 0;
+  border-top: 1px solid #e7ece9;
+}
+
+.device-list li.revoked { opacity: 0.6; }
+
+.device-icon {
+  display: grid;
+  width: 43px;
+  height: 43px;
+  place-items: center;
+  border-radius: 12px;
+  color: #287357;
+  background: #eaf5f0;
+  font-size: 22px;
+}
+
+.device-info,
+.device-title { min-width: 0; }
+
+.device-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.device-info > span,
+.device-info > small {
+  display: block;
+  margin-top: 4px;
+  color: #73817c;
+  font-size: 12px;
+}
+
+.current-pill,
+.revoked-pill { padding: 3px 7px; }
+
+.current-pill {
+  color: #176347;
+  background: #e1f4eb;
+}
+
+.revoked-pill {
+  color: #7d3731;
+  background: #f8e8e6;
+}
+
+.danger-button {
+  color: #a23a32;
+  border-color: #e3c5c1;
+}
+
+.danger-button:hover:not(:disabled) { background: #fff4f3; }
+
+@media (max-width: 760px) {
+  .app-header {
+    align-items: flex-start;
+    padding: 14px 18px;
+  }
+
+  .header-actions {
+    align-items: flex-end;
+    flex-direction: column-reverse;
+  }
+
+  .health-status.inline { padding: 5px 8px; }
+
+  .content-grid {
+    grid-template-columns: 1fr;
+    width: min(100% - 28px, 620px);
+    margin: 22px auto;
+  }
+
+  .profile-card,
+  .devices-card { padding: 22px; }
+}
+
+@media (max-width: 500px) {
+  .auth-card { padding: 28px 22px; }
+  .brand-inline small { display: none; }
+  .device-list li { grid-template-columns: auto minmax(0, 1fr); }
+
+  .device-list .danger-button {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
