@@ -67,11 +67,7 @@ function App() {
       })
       .catch((error: unknown) => {
         if (!active) return
-        clearAuthenticatedState(
-          apiClient.hasStoredSession()
-            ? getErrorMessage(error)
-            : 'Your session has ended. Please sign in again.',
-        )
+        clearAuthenticatedState(getErrorMessage(error))
       })
 
     return () => {
@@ -109,7 +105,7 @@ function App() {
       devices={devices}
       health={health}
       onDevicesChanged={refreshDevices}
-      onSignedOut={() => clearAuthenticatedState()}
+      onSignedOut={(message) => clearAuthenticatedState(message ?? null)}
       onCheckHealth={refreshHealth}
     />
   )

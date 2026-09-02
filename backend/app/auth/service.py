@@ -1,4 +1,5 @@
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from anyio import to_thread
@@ -8,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth.dependencies import Principal, _is_expired
-from app.auth.models import AuthSession, Device, User
+from app.auth.models import AuthSession, Device, RefreshTokenHistory, User
 from app.auth.schemas import (
     DeviceResponse,
     LoginRequest,
@@ -34,6 +35,10 @@ class InvalidCredentialsError(Exception):
     pass
 
 
+class RefreshTokenReuseError(InvalidCredentialsError):
+    pass
+
+
 class ForbiddenError(Exception):
     pass
 
@@ -44,6 +49,13 @@ class ConflictError(Exception):
 
 class NotFoundError(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedTokens:
+    response: TokenResponse
+    refresh_token: str
+    refresh_expires_at: datetime
 
 
 class AuthService:
@@ -68,7 +80,7 @@ class AuthService:
 
     async def login(
         self, session: AsyncSession, request: LoginRequest
-    ) -> TokenResponse:
+    ) -> IssuedTokens:
         user = (
             await session.execute(select(User).where(User.username == request.username))
         ).scalar_one_or_none()
@@ -103,6 +115,7 @@ class AuthService:
         auth_session = AuthSession(
             device_id=device.id,
             refresh_token_hash=hash_refresh_token(token),
+            refresh_cookie_bound=True,
             last_used_at=now,
             refresh_expires_at=now
             + timedelta(days=self.settings.refresh_token_ttl_days),
@@ -114,11 +127,18 @@ class AuthService:
             await session.rollback()
             raise ConflictError("device identifier is already registered") from exc
 
-        return self._tokens(user.id, device.id, auth_session.id, token)
+        return self._tokens(
+            user.id,
+            device.id,
+            auth_session.id,
+            token,
+            auth_session.refresh_expires_at,
+        )
 
     async def refresh(
         self, session: AsyncSession, refresh_token: str
-    ) -> TokenResponse:
+    ) -> IssuedTokens:
+        refresh_token_hash = hash_refresh_token(refresh_token)
         auth_session = (
             await session.execute(
                 select(AuthSession)
@@ -126,13 +146,36 @@ class AuthService:
                     selectinload(AuthSession.device).selectinload(Device.user)
                 )
                 .where(
-                    AuthSession.refresh_token_hash
-                    == hash_refresh_token(refresh_token)
+                    AuthSession.refresh_token_hash == refresh_token_hash
                 )
                 .with_for_update()
             )
         ).scalar_one_or_none()
+        # PostgreSQL may wait here for another rotation of the same token. Recheck
+        # the mutable predicate after acquiring the row lock so only one caller
+        # can rotate and every loser follows the consumed-token reuse path.
+        if (
+            auth_session is not None
+            and auth_session.refresh_token_hash != refresh_token_hash
+        ):
+            auth_session = None
         if auth_session is None:
+            reused_session = (
+                await session.execute(
+                    select(AuthSession)
+                    .join(
+                        RefreshTokenHistory,
+                        RefreshTokenHistory.auth_session_id == AuthSession.id,
+                    )
+                    .where(RefreshTokenHistory.token_hash == refresh_token_hash)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if reused_session is not None:
+                if reused_session.revoked_at is None:
+                    reused_session.revoked_at = datetime.now(UTC)
+                await session.commit()
+                raise RefreshTokenReuseError
             raise InvalidCredentialsError
 
         device = auth_session.device
@@ -144,27 +187,55 @@ class AuthService:
             or user.status != "active"
             or device.revoked_at is not None
             or auth_session.revoked_at is not None
+            or not auth_session.refresh_cookie_bound
             or _is_expired(auth_session.refresh_expires_at)
         ):
             raise InvalidCredentialsError
 
         now = datetime.now(UTC)
+        rotated_token = generate_refresh_token()
+        session.add(
+            RefreshTokenHistory(
+                token_hash=refresh_token_hash,
+                auth_session_id=auth_session.id,
+                consumed_at=now,
+            )
+        )
+        auth_session.refresh_token_hash = hash_refresh_token(rotated_token)
         auth_session.last_used_at = now
         device.last_seen_at = now
         await session.commit()
-        return self._tokens(user.id, device.id, auth_session.id, refresh_token)
-
-    async def logout(self, session: AsyncSession, principal: Principal) -> None:
-        now = datetime.now(UTC)
-        await session.execute(
-            update(AuthSession)
-            .where(
-                AuthSession.id == principal.session_id,
-                AuthSession.device_id == principal.device_id,
-                AuthSession.revoked_at.is_(None),
-            )
-            .values(revoked_at=now)
+        return self._tokens(
+            user.id,
+            device.id,
+            auth_session.id,
+            rotated_token,
+            auth_session.refresh_expires_at,
         )
+
+    async def logout(self, session: AsyncSession, refresh_token: str) -> None:
+        refresh_token_hash = hash_refresh_token(refresh_token)
+        auth_session = (
+            await session.execute(
+                select(AuthSession)
+                .where(AuthSession.refresh_token_hash == refresh_token_hash)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if auth_session is None:
+            auth_session = (
+                await session.execute(
+                    select(AuthSession)
+                    .join(
+                        RefreshTokenHistory,
+                        RefreshTokenHistory.auth_session_id == AuthSession.id,
+                    )
+                    .where(RefreshTokenHistory.token_hash == refresh_token_hash)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+        if auth_session is not None and auth_session.revoked_at is None:
+            auth_session.revoked_at = datetime.now(UTC)
         await session.commit()
 
     async def get_me(
@@ -236,14 +307,18 @@ class AuthService:
         device_id: uuid.UUID,
         session_id: uuid.UUID,
         refresh_token: str,
-    ) -> TokenResponse:
-        return TokenResponse(
-            access_token=create_access_token(
-                user_id=user_id,
-                device_id=device_id,
-                session_id=session_id,
-                settings=self.settings,
+        refresh_expires_at: datetime,
+    ) -> IssuedTokens:
+        return IssuedTokens(
+            response=TokenResponse(
+                access_token=create_access_token(
+                    user_id=user_id,
+                    device_id=device_id,
+                    session_id=session_id,
+                    settings=self.settings,
+                ),
+                expires_in=self.settings.access_token_ttl_minutes * 60,
             ),
             refresh_token=refresh_token,
-            expires_in=self.settings.access_token_ttl_minutes * 60,
+            refresh_expires_at=refresh_expires_at,
         )

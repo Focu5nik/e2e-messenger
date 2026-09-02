@@ -11,18 +11,19 @@ from app.config import get_settings
 from app.database import get_session
 
 settings = get_settings()
-app = FastAPI(title="Secure Messenger API", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
+api = FastAPI(title="Secure Messenger API", version="0.1.0")
+
+api.include_router(auth_router)
+
+app = CORSMiddleware(
+    app=api,
     allow_origins=[str(settings.frontend_origin).rstrip("/")],
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
-app.include_router(auth_router)
 
-
-@app.get("/health")
+@api.get("/health")
 async def health(session: Annotated[AsyncSession, Depends(get_session)]) -> dict[str, str]:
     try:
         await session.execute(text("SELECT 1"))
@@ -32,3 +33,6 @@ async def health(session: Annotated[AsyncSession, Depends(get_session)]) -> dict
             detail="database unavailable",
         ) from exc
     return {"status": "ok", "database": "ok"}
+
+
+

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -67,6 +67,9 @@ class AuthSession(Base):
     refresh_token_hash: Mapped[str] = mapped_column(
         String(64), unique=True, nullable=False
     )
+    refresh_cookie_bound: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="false", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -79,4 +82,18 @@ class AuthSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     device: Mapped["Device"] = relationship(
         back_populates="auth_sessions", lazy="raise"
+    )
+
+
+class RefreshTokenHistory(Base):
+    __tablename__ = "refresh_token_history"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    auth_session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("auth_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    consumed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )

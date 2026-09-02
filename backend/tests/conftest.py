@@ -9,7 +9,7 @@ from sqlalchemy.pool import StaticPool
 os.environ.setdefault("JWT_SECRET", "test-only-secret-that-is-at-least-32-characters")
 
 from app.database import Base, get_session  # noqa: E402
-from app.main import app  # noqa: E402
+from app.main import api, app  # noqa: E402
 
 
 @pytest_asyncio.fixture
@@ -37,11 +37,11 @@ async def client(
         async with session_factory() as session:
             yield session
 
-    app.dependency_overrides[get_session] = override_session
+    api.dependency_overrides[get_session] = override_session
     try:
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app), base_url="https://test"
         ) as test_client:
             yield test_client
     finally:
-        app.dependency_overrides.clear()
+        api.dependency_overrides.clear()

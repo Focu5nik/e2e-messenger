@@ -36,7 +36,7 @@ def _is_expired(value: datetime) -> bool:
         value = value.replace(tzinfo=UTC)
     return value <= datetime.now(UTC)
 
-
+ 
 async def get_principal(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -68,6 +68,7 @@ async def get_principal(
         or user.status != "active"
         or device.revoked_at is not None
         or auth_session.revoked_at is not None
+        or not auth_session.refresh_cookie_bound
         or _is_expired(auth_session.refresh_expires_at)
     ):
         raise unauthorized()

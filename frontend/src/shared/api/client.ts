@@ -22,7 +22,6 @@ export type Device = {
 
 type TokenResponse = {
   access_token: string
-  refresh_token: string
   token_type: 'bearer'
   expires_in: number
 }
@@ -44,8 +43,19 @@ export class ApiError extends Error {
   }
 }
 
-const API_URL = (import.meta.env.VITE_API_URL ?? 'http://localhost:8000').replace(/\/$/, '')
-const REFRESH_TOKEN_STORAGE_KEY = 'messenger.refresh-token'
+const API_URL = (import.meta.env?.VITE_API_URL ?? 'http://localhost:8000').replace(/\/$/, '')
+const REFRESH_LOCK_NAME = 'secure-messenger:auth-refresh'
+const LEGACY_REFRESH_TOKEN_STORAGE_KEY = 'messenger.refresh-token'
+
+function clearLegacyRefreshTokenStorage(): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(LEGACY_REFRESH_TOKEN_STORAGE_KEY)
+    }
+  } catch {
+    // Storage can be unavailable; this client never reads or writes the legacy token.
+  }
+}
 
 function errorMessage(detail: ErrorDetail | undefined, fallback: string): string {
   if (typeof detail === 'string') return detail
@@ -82,13 +92,14 @@ export class ApiClient {
   private refreshPromise: Promise<void> | null = null
   private refreshTimer: number | null = null
   private sessionExpiredHandler: (() => void) | null = null
+  private sessionRevision = 0
+
+  constructor() {
+    clearLegacyRefreshTokenStorage()
+  }
 
   setSessionExpiredHandler(handler: () => void): void {
     this.sessionExpiredHandler = handler
-  }
-
-  hasStoredSession(): boolean {
-    return localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) !== null
   }
 
   async register(username: string, password: string): Promise<User> {
@@ -99,32 +110,38 @@ export class ApiClient {
   }
 
   async login(username: string, password: string, device: LoginDevice): Promise<void> {
-    const tokens = await this.publicRequest<TokenResponse>('/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({
-        username,
-        password,
-        device_id: device.id,
-        device_name: device.name,
-      }),
+    await this.withRefreshCookieLock(async () => {
+      const tokens = await this.publicRequest<TokenResponse>('/auth/login', {
+        method: 'POST',
+        credentials: 'include',
+        body: JSON.stringify({
+          username,
+          password,
+          device_id: device.id,
+          device_name: device.name,
+        }),
+      })
+      this.clearSession(false)
+      this.acceptTokens(tokens)
     })
-    this.acceptTokens(tokens)
   }
 
   async restoreSession(): Promise<boolean> {
-    if (!this.hasStoredSession()) return false
-    await this.refreshAccessToken()
-    return true
+    try {
+      await this.refreshAccessToken(false)
+      return this.accessToken !== null
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) return false
+      throw error
+    }
   }
 
   async logout(): Promise<void> {
-    try {
-      if (this.accessToken) {
-        await this.authenticatedRequest<void>('/auth/logout', { method: 'POST' })
-      }
-    } finally {
-      this.clearSession(false)
-    }
+    this.clearSession(false)
+    await this.withRefreshCookieLock(() => this.publicRequest<void>('/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+    }))
   }
 
   getCurrentUser(): Promise<CurrentUser> {
@@ -139,10 +156,6 @@ export class ApiClient {
     return this.authenticatedRequest<void>(`/devices/${encodeURIComponent(deviceId)}`, {
       method: 'DELETE',
     })
-  }
-
-  forgetSession(): void {
-    this.clearSession(false)
   }
 
   private async publicRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -195,23 +208,22 @@ export class ApiClient {
     return (await response.json()) as T
   }
 
-  private refreshAccessToken(): Promise<void> {
+  private refreshAccessToken(notifyOnFailure = true): Promise<void> {
     if (this.refreshPromise) return this.refreshPromise
 
-    const refreshToken = localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY)
-    if (!refreshToken) {
-      this.clearSession(true)
-      return Promise.reject(new ApiError('Your session has ended. Please sign in again.', 401))
-    }
-
-    this.refreshPromise = this.publicRequest<TokenResponse>('/auth/refresh', {
+    const sessionRevision = this.sessionRevision
+    const refresh = () => this.publicRequest<TokenResponse>('/auth/refresh', {
       method: 'POST',
-      body: JSON.stringify({ refresh_token: refreshToken }),
+      credentials: 'include',
     })
-      .then((tokens) => this.acceptTokens(tokens))
+    this.refreshPromise = this.withRefreshCookieLock(refresh)
+      .then((tokens) => {
+        if (sessionRevision === this.sessionRevision) this.acceptTokens(tokens)
+      })
       .catch((error: unknown) => {
+        if (sessionRevision !== this.sessionRevision) return
         if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
-          this.clearSession(true)
+          this.clearSession(notifyOnFailure)
         }
         throw error
       })
@@ -222,9 +234,13 @@ export class ApiClient {
     return this.refreshPromise
   }
 
+  private withRefreshCookieLock<T>(operation: () => Promise<T>): Promise<T> {
+    const lockManager = typeof navigator === 'undefined' ? undefined : navigator.locks
+    return lockManager ? lockManager.request(REFRESH_LOCK_NAME, operation) : operation()
+  }
+
   private acceptTokens(tokens: TokenResponse): void {
     this.accessToken = tokens.access_token
-    localStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, tokens.refresh_token)
     this.scheduleRefresh(tokens.expires_in)
   }
 
@@ -235,7 +251,7 @@ export class ApiClient {
     this.refreshTimer = window.setTimeout(() => {
       this.refreshAccessToken().catch((error: unknown) => {
         if (
-          this.hasStoredSession()
+          this.accessToken !== null
           && (!(error instanceof ApiError) || error.status === 0 || error.status >= 500)
         ) {
           this.refreshTimer = window.setTimeout(() => {
@@ -247,8 +263,8 @@ export class ApiClient {
   }
 
   private clearSession(notify: boolean): void {
+    this.sessionRevision += 1
     this.accessToken = null
-    localStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY)
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer)
     this.refreshTimer = null
     if (notify) this.sessionExpiredHandler?.()

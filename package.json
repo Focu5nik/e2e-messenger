@@ -6,8 +6,10 @@
     "dev:frontend": "npm --prefix frontend run dev",
     "migrate": "uv run --project backend alembic -c backend/alembic.ini upgrade head",
     "test:backend": "uv run --project backend pytest backend/tests",
-    "test:frontend": "npm --prefix frontend run build",
+    "test:frontend": "npm --prefix frontend run test && npm --prefix frontend run build",
     "test": "npm run test:backend && npm run test:frontend"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1"
   }
 }
-

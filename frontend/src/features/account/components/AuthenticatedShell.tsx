@@ -12,7 +12,7 @@ type AuthenticatedShellProps = {
   devices: Device[]
   health: 'checking' | 'online' | 'offline'
   onDevicesChanged: () => Promise<void>
-  onSignedOut: () => void
+  onSignedOut: (message?: string) => void
   onCheckHealth: () => void
 }
 
@@ -45,8 +45,14 @@ export function AuthenticatedShell({
     try {
       await api.revokeDevice(device.id)
       if (device.is_current) {
-        api.forgetSession()
-        onSignedOut()
+        try {
+          await api.logout()
+          onSignedOut()
+        } catch (logoutError) {
+          onSignedOut(
+            `Device revoked, but its browser cookie could not be cleared: ${getErrorMessage(logoutError)}`,
+          )
+        }
       } else {
         await onDevicesChanged()
       }
@@ -65,8 +71,9 @@ export function AuthenticatedShell({
       await api.logout()
       onSignedOut()
     } catch (logoutError) {
-      setError(getErrorMessage(logoutError))
-      onSignedOut()
+      onSignedOut(
+        `The server could not confirm sign-out. Reconnect and sign out again: ${getErrorMessage(logoutError)}`,
+      )
     } finally {
       setSigningOut(false)
     }
