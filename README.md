@@ -1,7 +1,7 @@
 # Secure Messenger
 
-V1 monorepo with a FastAPI backend, React frontend, PostgreSQL, JWT authentication,
-and account-scoped device identity.
+V2 monorepo with a FastAPI backend, React frontend, PostgreSQL, JWT authentication,
+account-scoped device identity, and one-to-one chat discovery.
 
 ## Local setup
 
@@ -32,10 +32,11 @@ npm run dev:frontend
 
 Open the URL configured by `FRONTEND_ORIGIN` in `.env`. Vite uses the same setting
 for its host and port and exits if that port is already occupied, preventing a CORS
-origin mismatch. You can register, sign in on the persistent browser device,
-refresh the session, inspect account devices, revoke a device, and sign out.
+origin mismatch. You can register, sign in on the persistent browser device, find
+active users, open a unique direct chat, switch chats, inspect account devices,
+revoke a device, and sign out.
 
-## V1 API
+## V2 API
 
 - `POST /auth/register`
 - `POST /auth/login`
@@ -44,6 +45,10 @@ refresh the session, inspect account devices, revoke a device, and sign out.
 - `GET /me`
 - `GET /devices`
 - `DELETE /devices/{id}`
+- `GET /users?search={username}`
+- `POST /chats/direct/{user_id}`
+- `GET /chats`
+- `GET /chats/{chat_id}`
 
 Access tokens are short-lived JWTs returned in response bodies. Refresh tokens are
 sent only in host-only `Secure; HttpOnly; SameSite=Strict` cookies, rotated after
@@ -60,6 +65,13 @@ after upgrading, and the frontend removes the legacy refresh-token value from
 Production must serve the API over HTTPS and keep the frontend and API on the same
 site; browsers will not send a `SameSite=Strict` refresh cookie across unrelated sites.
 
+Direct-chat creation canonicalizes the two user IDs and is idempotent in either
+participant order. The database unique constraint resolves concurrent creation, and
+the losing transaction returns the winning chat without leaving an orphan. Chat list
+and detail access require the requester to be both a pair endpoint and one of exactly
+two matching membership rows. Direct-chat responses contain `id`, `type`,
+`created_at`, and the `other_user`.
+
 ## Backend layout
 
 ```text
@@ -68,6 +80,7 @@ backend/app/
   config.py     # Environment-backed settings
   database.py   # SQLAlchemy engine, sessions, and declarative base
   auth/         # V1 authentication and device-identity feature
+  chats/        # V2 user discovery and direct-chat feature
 ```
 
 New roadmap features should be added as sibling feature packages such as `chats/`,

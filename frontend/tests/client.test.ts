@@ -142,3 +142,51 @@ test('logout invalidates a late refresh result even without Web Locks', async ()
   const logoutRequest = requests.find(({ url }) => url.endsWith('/auth/logout'))
   assert.equal(logoutRequest?.init.credentials, 'include')
 })
+
+test('direct chat methods use authenticated V2 endpoints and encode path and search values', async () => {
+  removeLockManager()
+  const requests: Array<{ init: RequestInit; url: string }> = []
+  const otherUser = {
+    id: 'peer/id',
+    username: 'bob smith',
+    status: 'active',
+    created_at: '2026-09-02T00:00:00Z',
+  }
+  const chat = {
+    id: 'chat/id',
+    type: 'DIRECT',
+    created_at: '2026-09-03T00:00:00Z',
+    other_user: otherUser,
+  }
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    requests.push({ init, url })
+    if (url.endsWith('/auth/login')) return tokenResponse('v2-access-token')
+    if (url.endsWith('/users?search=bob+smith')) return Response.json([otherUser])
+    if (url.endsWith('/chats/direct/peer%2Fid')) return Response.json(chat)
+    if (url.endsWith('/chats')) return Response.json([chat])
+    if (url.endsWith('/chats/chat%2Fid')) return Response.json(chat)
+    throw new Error(`Unexpected request: ${url}`)
+  }
+
+  const client = new ApiClient()
+  await client.login('alice', 'correct horse', { id: 'device-id', name: 'Browser' })
+
+  assert.deepEqual(await client.searchUsers('bob smith'), [otherUser])
+  assert.deepEqual(await client.createDirectChat('peer/id'), chat)
+  assert.deepEqual(await client.getChats(), [chat])
+  assert.deepEqual(await client.getChat('chat/id'), chat)
+
+  const v2Requests = requests.slice(1)
+  assert.deepEqual(v2Requests.map(({ init }) => init.method ?? 'GET'), [
+    'GET',
+    'POST',
+    'GET',
+    'GET',
+  ])
+  for (const { init } of v2Requests) {
+    assert.equal(new Headers(init.headers).get('Authorization'), 'Bearer v2-access-token')
+  }
+  assert.equal(v2Requests[1].init.body, undefined)
+})

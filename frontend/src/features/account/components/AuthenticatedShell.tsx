@@ -5,6 +5,7 @@ import {
   type CurrentUser,
   type Device,
 } from '../../../shared/api'
+import { ChatWorkspace } from '../../chats'
 
 type AuthenticatedShellProps = {
   api: ApiClient
@@ -31,6 +32,7 @@ export function AuthenticatedShell({
   onSignedOut,
   onCheckHealth,
 }: AuthenticatedShellProps) {
+  const [view, setView] = useState<'chats' | 'account'>('chats')
   const [busyDeviceId, setBusyDeviceId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [signingOut, setSigningOut] = useState(false)
@@ -86,6 +88,24 @@ export function AuthenticatedShell({
           <div className="brand-mark small" aria-hidden="true">S</div>
           <div><strong>Secure Messenger</strong><small>Private by design</small></div>
         </div>
+        <nav className="primary-nav" aria-label="Main navigation">
+          <button
+            type="button"
+            className={view === 'chats' ? 'active' : ''}
+            aria-current={view === 'chats' ? 'page' : undefined}
+            onClick={() => setView('chats')}
+          >
+            Chats
+          </button>
+          <button
+            type="button"
+            className={view === 'account' ? 'active' : ''}
+            aria-current={view === 'account' ? 'page' : undefined}
+            onClick={() => setView('account')}
+          >
+            Account &amp; devices
+          </button>
+        </nav>
         <div className="header-actions">
           <button className={`health-status inline ${health}`} type="button" onClick={onCheckHealth}>
             <span aria-hidden="true" /> Backend {health}
@@ -96,61 +116,65 @@ export function AuthenticatedShell({
         </div>
       </header>
 
-      <div className="content-grid">
-        <aside className="profile-card" aria-labelledby="profile-heading">
-          <div className="avatar" aria-hidden="true">{user.username.slice(0, 1).toUpperCase()}</div>
-          <p className="eyebrow">Signed in as</p>
-          <h1 id="profile-heading">{user.username}</h1>
-          <span className="status-pill">{user.status}</span>
-          <dl>
-            <div><dt>User ID</dt><dd>{user.id}</dd></div>
-            <div><dt>Member since</dt><dd>{formatDate(user.created_at)}</dd></div>
-          </dl>
-        </aside>
+      {view === 'chats' ? (
+        <ChatWorkspace api={api} user={user} />
+      ) : (
+        <div className="content-grid">
+          <aside className="profile-card" aria-labelledby="profile-heading">
+            <div className="avatar" aria-hidden="true">{user.username.slice(0, 1).toUpperCase()}</div>
+            <p className="eyebrow">Signed in as</p>
+            <h1 id="profile-heading">{user.username}</h1>
+            <span className="status-pill">{user.status}</span>
+            <dl>
+              <div><dt>User ID</dt><dd>{user.id}</dd></div>
+              <div><dt>Member since</dt><dd>{formatDate(user.created_at)}</dd></div>
+            </dl>
+          </aside>
 
-        <section className="devices-card" aria-labelledby="devices-heading">
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">Account security</p>
-              <h2 id="devices-heading">Your devices</h2>
+          <section className="devices-card" aria-labelledby="devices-heading">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">Account security</p>
+                <h2 id="devices-heading">Your devices</h2>
+              </div>
+              <span className="count-pill">{devices.filter((device) => !device.revoked_at).length} active</span>
             </div>
-            <span className="count-pill">{devices.filter((device) => !device.revoked_at).length} active</span>
-          </div>
-          <p className="section-description">
-            Review browsers signed in to your account. Revoking a device ends all of its sessions.
-          </p>
+            <p className="section-description">
+              Review browsers signed in to your account. Revoking a device ends all of its sessions.
+            </p>
 
-          {error && <p className="form-error" role="alert">{error}</p>}
+            {error && <p className="form-error" role="alert">{error}</p>}
 
-          <ul className="device-list">
-            {devices.map((device) => (
-              <li key={device.id} className={device.revoked_at ? 'revoked' : ''}>
-                <div className="device-icon" aria-hidden="true">▣</div>
-                <div className="device-info">
-                  <div className="device-title">
-                    <strong>{device.name}</strong>
-                    {device.is_current && <span className="current-pill">This device</span>}
-                    {device.revoked_at && <span className="revoked-pill">Revoked</span>}
+            <ul className="device-list">
+              {devices.map((device) => (
+                <li key={device.id} className={device.revoked_at ? 'revoked' : ''}>
+                  <div className="device-icon" aria-hidden="true">▣</div>
+                  <div className="device-info">
+                    <div className="device-title">
+                      <strong>{device.name}</strong>
+                      {device.is_current && <span className="current-pill">This device</span>}
+                      {device.revoked_at && <span className="revoked-pill">Revoked</span>}
+                    </div>
+                    <span>Last active {formatDate(device.last_seen_at)}</span>
+                    <small>Added {formatDate(device.created_at)} · Protocol v{device.protocol_version}</small>
                   </div>
-                  <span>Last active {formatDate(device.last_seen_at)}</span>
-                  <small>Added {formatDate(device.created_at)} · Protocol v{device.protocol_version}</small>
-                </div>
-                {!device.revoked_at && (
-                  <button
-                    className="danger-button"
-                    type="button"
-                    disabled={busyDeviceId !== null}
-                    onClick={() => revokeDevice(device)}
-                    aria-label={`Revoke ${device.name}${device.is_current ? ', this device' : ''}`}
-                  >
-                    {busyDeviceId === device.id ? 'Revoking…' : 'Revoke'}
-                  </button>
-                )}
-              </li>
-            ))}
-          </ul>
-        </section>
-      </div>
+                  {!device.revoked_at && (
+                    <button
+                      className="danger-button"
+                      type="button"
+                      disabled={busyDeviceId !== null}
+                      onClick={() => revokeDevice(device)}
+                      aria-label={`Revoke ${device.name}${device.is_current ? ', this device' : ''}`}
+                    >
+                      {busyDeviceId === device.id ? 'Revoking…' : 'Revoke'}
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </section>
+        </div>
+      )}
     </main>
   )
 }

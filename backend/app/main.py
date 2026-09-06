@@ -7,6 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.router import router as auth_router
+from app.chats.router import router as chats_router
 from app.config import get_settings
 from app.database import get_session
 
@@ -14,6 +15,7 @@ settings = get_settings()
 api = FastAPI(title="Secure Messenger API", version="0.1.0")
 
 api.include_router(auth_router)
+api.include_router(chats_router)
 
 app = CORSMiddleware(
     app=api,
@@ -33,6 +35,5 @@ async def health(session: Annotated[AsyncSession, Depends(get_session)]) -> dict
             detail="database unavailable",
         ) from exc
     return {"status": "ok", "database": "ok"}
-
 
 

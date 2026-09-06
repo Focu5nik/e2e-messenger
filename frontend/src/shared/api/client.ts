@@ -20,6 +20,13 @@ export type Device = {
   is_current: boolean
 }
 
+export type DirectChat = {
+  id: string
+  type: 'DIRECT'
+  created_at: string
+  other_user: User
+}
+
 type TokenResponse = {
   access_token: string
   token_type: 'bearer'
@@ -156,6 +163,26 @@ export class ApiClient {
     return this.authenticatedRequest<void>(`/devices/${encodeURIComponent(deviceId)}`, {
       method: 'DELETE',
     })
+  }
+
+  searchUsers(search: string): Promise<User[]> {
+    const query = new URLSearchParams({ search })
+    return this.authenticatedRequest<User[]>(`/users?${query.toString()}`)
+  }
+
+  getChats(): Promise<DirectChat[]> {
+    return this.authenticatedRequest<DirectChat[]>('/chats')
+  }
+
+  getChat(chatId: string): Promise<DirectChat> {
+    return this.authenticatedRequest<DirectChat>(`/chats/${encodeURIComponent(chatId)}`)
+  }
+
+  createDirectChat(userId: string): Promise<DirectChat> {
+    return this.authenticatedRequest<DirectChat>(
+      `/chats/direct/${encodeURIComponent(userId)}`,
+      { method: 'POST' },
+    )
   }
 
   private async publicRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
