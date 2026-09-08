@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Keep Windows command scripts native so they remain compatible with cmd.exe.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
