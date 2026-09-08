@@ -51,7 +51,7 @@ function tokenResponse(accessToken: string): Response {
   })
 }
 
-const { ApiClient } = await import('../src/shared/api/client.ts')
+const { ApiClient, ApiError } = await import('../src/shared/api/client.ts')
 
 test('login uses the cookie lock and keeps only the access token in memory', async () => {
   removedStorageKeys.length = 0
@@ -189,4 +189,94 @@ test('direct chat methods use authenticated V2 endpoints and encode path and sea
     assert.equal(new Headers(init.headers).get('Authorization'), 'Bearer v2-access-token')
   }
   assert.equal(v2Requests[1].init.body, undefined)
+})
+
+test('messaging methods use the V3 device, send, and mailbox contracts', async () => {
+  removeLockManager()
+  const requests: Array<{ init: RequestInit; url: string }> = []
+  const command = {
+    chat_id: 'chat/id',
+    client_message_id: 'client-message-id',
+    envelopes: [{
+      recipient_device_id: 'device/id',
+      protocol_version: 0,
+      envelope_type: 'PLAINTEXT',
+      payload: 'aGVsbG8=',
+    }],
+  }
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    requests.push({ init, url })
+    if (url.endsWith('/auth/login')) return tokenResponse('v3-access-token')
+    if (url.endsWith('/chats/chat%2Fid/destination-devices')) {
+      return Response.json([{ id: 'device/id', protocol_version: 0 }])
+    }
+    if (url.endsWith('/messages')) {
+      return Response.json({
+        id: 'message-id',
+        chat_id: 'chat/id',
+        sender_user_id: 'user-id',
+        sender_device_id: 'sender-device-id',
+        client_message_id: command.client_message_id,
+        created_at: '2026-09-07T00:00:00Z',
+        envelopes: [],
+      })
+    }
+    if (url.endsWith('/messages/mailbox?after_seq=41&limit=25')) {
+      return Response.json({ envelopes: [], next_seq: 41, has_more: false })
+    }
+    throw new Error(`Unexpected request: ${url}`)
+  }
+
+  const client = new ApiClient()
+  await client.login('alice', 'correct horse', { id: 'device-id', name: 'Browser' })
+
+  assert.deepEqual(await client.getDestinationDevices('chat/id'), [
+    { id: 'device/id', protocol_version: 0 },
+  ])
+  assert.equal((await client.sendMessage(command)).id, 'message-id')
+  assert.deepEqual(await client.getMailbox(41, 25), {
+    envelopes: [],
+    next_seq: 41,
+    has_more: false,
+  })
+
+  const v3Requests = requests.slice(1)
+  assert.deepEqual(v3Requests.map(({ init }) => init.method ?? 'GET'), ['GET', 'POST', 'GET'])
+  assert.deepEqual(JSON.parse(String(v3Requests[1].init.body)), command)
+  for (const { init } of v3Requests) {
+    assert.equal(new Headers(init.headers).get('Authorization'), 'Bearer v3-access-token')
+  }
+})
+
+test('structured API errors preserve the retryable delivery target code', async () => {
+  removeLockManager()
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url.endsWith('/auth/login')) return tokenResponse('v3-access-token')
+    if (url.endsWith('/messages')) {
+      return Response.json({
+        detail: {
+          code: 'delivery_targets_changed',
+          message: 'Destination devices changed; refresh and retry.',
+        },
+      }, { status: 409 })
+    }
+    throw new Error(`Unexpected request: ${url}`)
+  }
+
+  const client = new ApiClient()
+  await client.login('alice', 'correct horse', { id: 'device-id', name: 'Browser' })
+
+  await assert.rejects(
+    client.sendMessage({ chat_id: 'chat-id', client_message_id: 'client-id', envelopes: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError)
+      assert.equal(error.status, 409)
+      assert.equal(error.code, 'delivery_targets_changed')
+      assert.equal(error.message, 'Destination devices changed; refresh and retry.')
+      return true
+    },
+  )
 })

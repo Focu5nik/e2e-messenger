@@ -26,6 +26,7 @@ from app.auth.security import (
     verify_password,
 )
 from app.config import Settings
+from app.messages.models import DeviceMailbox
 
 # A valid hash keeps nonexistent-user verification on the same expensive code path.
 _DUMMY_PASSWORD_HASH = PASSWORD_HASH.hash("not-a-real-user-password")
@@ -90,6 +91,18 @@ class AuthService:
         )
         if user is None or not password_matches:
             raise InvalidCredentialsError
+
+        # Message delivery holds a shared lock on this row while resolving and
+        # storing envelopes. An exclusive lock serializes device-set mutations
+        # with that delivery transaction.
+        user = (
+            await session.execute(
+                select(User)
+                .where(User.id == user.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
         if user.status != "active":
             raise ForbiddenError("account is not active")
 
@@ -103,6 +116,17 @@ class AuthService:
                 last_seen_at=now,
             )
             session.add(device)
+            # DeviceMailbox has no ORM relationship by design. Flush the device
+            # first to preserve its FK dependency while keeping both inserts in
+            # the same transaction.
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise ConflictError(
+                    "device identifier is already registered"
+                ) from exc
+            session.add(DeviceMailbox(device_id=device.id))
         elif device.user_id != user.id:
             raise ConflictError("device identifier is already registered")
         elif device.revoked_at is not None:
@@ -279,11 +303,17 @@ class AuthService:
     async def revoke_device(
         self, session: AsyncSession, principal: Principal, device_id: uuid.UUID
     ) -> None:
+        await session.execute(
+            select(User.id)
+            .where(User.id == principal.user_id)
+            .with_for_update()
+        )
         device = (
             await session.execute(
                 select(Device).where(
                     Device.id == device_id, Device.user_id == principal.user_id
                 )
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if device is None:

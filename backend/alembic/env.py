@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.auth import models as auth_models  # noqa: F401
 from app.chats import models as chat_models  # noqa: F401
+from app.messages import models as message_models  # noqa: F401
 from app.config import get_settings
 from app.database import Base
 

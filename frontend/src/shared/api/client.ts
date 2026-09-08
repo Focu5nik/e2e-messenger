@@ -27,6 +27,59 @@ export type DirectChat = {
   other_user: User
 }
 
+export type DestinationDevice = {
+  id: string
+  protocol_version: number
+}
+
+export type ClientEnvelope = {
+  recipient_device_id: string
+  protocol_version: number
+  envelope_type: string
+  payload: string
+}
+
+export type SendMessageRequest = {
+  chat_id: string
+  client_message_id: string
+  envelopes: ClientEnvelope[]
+}
+
+export type MessageEnvelope = Omit<ClientEnvelope, 'payload'> & {
+  id: string
+  message_id: string
+  mailbox_seq: number
+  payload: string | null
+  created_at: string
+  expires_at: string
+  delivered_at: string | null
+  payload_purged_at: string | null
+}
+
+export type SentMessage = {
+  id: string
+  chat_id: string
+  sender_user_id: string
+  sender_device_id: string
+  client_message_id: string
+  created_at: string
+  envelopes: MessageEnvelope[]
+}
+
+export type MailboxEnvelope = MessageEnvelope & {
+  chat_id: string
+  sender_user_id: string
+  sender_device_id: string
+  client_message_id: string
+  message_created_at: string
+}
+
+export type MailboxPage = {
+  envelopes: MailboxEnvelope[]
+  next_seq: number
+  has_more: boolean
+}
+
 type TokenResponse = {
   access_token: string
   token_type: 'bearer'
@@ -38,15 +91,20 @@ type LoginDevice = {
   name: string
 }
 
-type ErrorDetail = string | Array<{ loc?: Array<string | number>; msg?: string }>
+type ErrorDetail =
+  | string
+  | Array<{ loc?: Array<string | number>; msg?: string }>
+  | { code?: string; message?: string }
 
 export class ApiError extends Error {
   status: number
+  code: string | null
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code: string | null = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
   }
 }
 
@@ -70,6 +128,7 @@ function errorMessage(detail: ErrorDetail | undefined, fallback: string): string
     const messages = detail.flatMap((item) => (item.msg ? [item.msg] : []))
     if (messages.length > 0) return messages.join('. ')
   }
+  if (detail && 'message' in detail && detail.message) return detail.message
   return fallback
 }
 
@@ -83,7 +142,10 @@ async function parseError(response: Response): Promise<ApiError> {
     // The HTTP status still provides a useful fallback when the body is empty.
   }
 
-  return new ApiError(errorMessage(detail, `Request failed (${response.status})`), response.status)
+  const code = detail && !Array.isArray(detail) && typeof detail !== 'string'
+    ? detail.code ?? null
+    : null
+  return new ApiError(errorMessage(detail, `Request failed (${response.status})`), response.status, code)
 }
 
 async function fetchApi(path: string, init: RequestInit): Promise<Response> {
@@ -183,6 +245,27 @@ export class ApiClient {
       `/chats/direct/${encodeURIComponent(userId)}`,
       { method: 'POST' },
     )
+  }
+
+  getDestinationDevices(chatId: string): Promise<DestinationDevice[]> {
+    return this.authenticatedRequest<DestinationDevice[]>(
+      `/chats/${encodeURIComponent(chatId)}/destination-devices`,
+    )
+  }
+
+  sendMessage(command: SendMessageRequest): Promise<SentMessage> {
+    return this.authenticatedRequest<SentMessage>('/messages', {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+  }
+
+  getMailbox(afterSeq: number, limit = 100): Promise<MailboxPage> {
+    const query = new URLSearchParams({
+      after_seq: String(afterSeq),
+      limit: String(limit),
+    })
+    return this.authenticatedRequest<MailboxPage>(`/messages/mailbox?${query.toString()}`)
   }
 
   private async publicRequest<T>(path: string, init: RequestInit = {}): Promise<T> {

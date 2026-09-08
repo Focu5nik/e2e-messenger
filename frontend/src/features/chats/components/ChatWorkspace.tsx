@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import {
   getErrorMessage,
   type ApiClient,
@@ -6,10 +6,21 @@ import {
   type DirectChat,
   type User,
 } from '../../../shared/api'
+import {
+  MessengerService,
+  PlaintextMessageCodec,
+  type ReceivedMessage,
+} from '../../messaging'
 
 type ChatWorkspaceProps = {
   api: ApiClient
   user: CurrentUser
+}
+
+const LAST_CHAT_STORAGE_KEY = 'messenger.lastChat'
+
+function lastChatStorageKey(userId: string): string {
+  return `${LAST_CHAT_STORAGE_KEY}.${userId}`
 }
 
 function formatDate(value: string): string {
@@ -17,6 +28,20 @@ function formatDate(value: string): string {
   if (Number.isNaN(date.getTime())) return 'Unknown'
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date)
 }
+
+function formatMessageTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'short',
+    timeStyle: 'short',
+  }).format(date)
+}
+
+type DisplayMessage = Pick<
+  ReceivedMessage,
+  'messageId' | 'chatId' | 'senderUserId' | 'content' | 'createdAt'
+>
 
 function upsertChat(chats: DirectChat[], chat: DirectChat): DirectChat[] {
   const existingIndex = chats.findIndex((candidate) => candidate.id === chat.id)
@@ -28,6 +53,10 @@ function upsertChat(chats: DirectChat[], chat: DirectChat): DirectChat[] {
 }
 
 export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
+  const messenger = useMemo(
+    () => new MessengerService(api, new PlaintextMessageCodec()),
+    [api],
+  )
   const [chats, setChats] = useState<DirectChat[]>([])
   const [selectedChat, setSelectedChat] = useState<DirectChat | null>(null)
   const [loadingChats, setLoadingChats] = useState(true)
@@ -38,14 +67,54 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [openingUserId, setOpeningUserId] = useState<string | null>(null)
+  const [messages, setMessages] = useState<DisplayMessage[]>([])
+  const [loadingMailbox, setLoadingMailbox] = useState(true)
+  const [mailboxError, setMailboxError] = useState<string | null>(null)
+  const [draft, setDraft] = useState('')
+  const [sending, setSending] = useState(false)
+  const [sendError, setSendError] = useState<string | null>(null)
   const selectionRequest = useRef(0)
+
+  const selectChat = useCallback(async (chat: DirectChat) => {
+    const request = selectionRequest.current + 1
+    selectionRequest.current = request
+    setSelectedChat(chat)
+    setLoadingChatId(chat.id)
+    setChatsError(null)
+    setSendError(null)
+    localStorage.setItem(lastChatStorageKey(user.id), chat.id)
+
+    try {
+      const freshChat = await api.getChat(chat.id)
+      if (request !== selectionRequest.current) return
+      setSelectedChat(freshChat)
+      setChats((current) => upsertChat(current, freshChat))
+    } catch (error) {
+      if (request !== selectionRequest.current) return
+      setSelectedChat(null)
+      localStorage.removeItem(lastChatStorageKey(user.id))
+      setChatsError(getErrorMessage(error))
+    } finally {
+      if (request === selectionRequest.current) setLoadingChatId(null)
+    }
+  }, [api, user.id])
 
   useEffect(() => {
     let active = true
 
     void api.getChats()
       .then((nextChats) => {
-        if (active) setChats(nextChats)
+        if (!active) return
+
+        setChats(nextChats)
+        const lastChatId = localStorage.getItem(lastChatStorageKey(user.id))
+        const lastChat = nextChats.find((chat) => chat.id === lastChatId)
+
+        if (lastChat) {
+          void selectChat(lastChat)
+        } else if (lastChatId) {
+          localStorage.removeItem(lastChatStorageKey(user.id))
+        }
       })
       .catch((error: unknown) => {
         if (active) setChatsError(getErrorMessage(error))
@@ -58,28 +127,26 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
       active = false
       selectionRequest.current += 1
     }
-  }, [api])
+  }, [api, selectChat, user.id])
 
-  async function selectChat(chat: DirectChat) {
-    const request = selectionRequest.current + 1
-    selectionRequest.current = request
-    setSelectedChat(chat)
-    setLoadingChatId(chat.id)
-    setChatsError(null)
+  useEffect(() => {
+    let active = true
 
-    try {
-      const freshChat = await api.getChat(chat.id)
-      if (request !== selectionRequest.current) return
-      setSelectedChat(freshChat)
-      setChats((current) => upsertChat(current, freshChat))
-    } catch (error) {
-      if (request !== selectionRequest.current) return
-      setSelectedChat(null)
-      setChatsError(getErrorMessage(error))
-    } finally {
-      if (request === selectionRequest.current) setLoadingChatId(null)
+    void messenger.loadMailbox()
+      .then(({ messages: receivedMessages }) => {
+        if (active) setMessages(receivedMessages)
+      })
+      .catch((error: unknown) => {
+        if (active) setMailboxError(getErrorMessage(error))
+      })
+      .finally(() => {
+        if (active) setLoadingMailbox(false)
+      })
+
+    return () => {
+      active = false
     }
-  }
+  }, [messenger])
 
   async function findPeople(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -105,6 +172,7 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
       selectionRequest.current += 1
       setChats((current) => upsertChat(current, chat))
       setSelectedChat(chat)
+      localStorage.setItem(lastChatStorageKey(user.id), chat.id)
       setChatsError(null)
       setSearch('')
       setSearchResults(null)
@@ -114,6 +182,39 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
       setOpeningUserId(null)
     }
   }
+
+  async function sendText(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedChat || !draft.trim() || sending) return
+
+    const chat = selectedChat
+    const content = draft
+    setSending(true)
+    setSendError(null)
+
+    try {
+      const accepted = await messenger.sendText(chat.id, content)
+      setMessages((current) => [
+        ...current.filter((message) => message.messageId !== accepted.id),
+        {
+          messageId: accepted.id,
+          chatId: accepted.chat_id,
+          senderUserId: accepted.sender_user_id,
+          content,
+          createdAt: accepted.created_at,
+        },
+      ])
+      setDraft('')
+    } catch (error) {
+      setSendError(getErrorMessage(error))
+    } finally {
+      setSending(false)
+    }
+  }
+
+  const selectedMessages = selectedChat
+    ? messages.filter((message) => message.chatId === selectedChat.id)
+    : []
 
   return (
     <div className="chat-layout">
@@ -229,15 +330,58 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
               </div>
               <span className="secure-pill">Private</span>
             </header>
-            <div className="chat-empty-state">
-              <div className="empty-lock" aria-hidden="true">S</div>
-              <h3>Chat ready</h3>
-              <p>
-                Your direct chat with {selectedChat.other_user.username} is open. Secure messaging
-                will appear here in the next version.
-              </p>
-              <small>Created {formatDate(selectedChat.created_at)}</small>
+            <div className="message-stage">
+              {mailboxError && (
+                <p className="message-status error" role="alert">
+                  Could not load messages: {mailboxError}
+                </p>
+              )}
+              {loadingMailbox ? (
+                <p className="message-status" aria-live="polite">Loading messages...</p>
+              ) : selectedMessages.length === 0 ? (
+                <div className="chat-empty-state message-empty">
+                  <div className="empty-lock" aria-hidden="true">S</div>
+                  <h3>No messages yet</h3>
+                  <p>Send the first message to {selectedChat.other_user.username}.</p>
+                  <small>Chat created {formatDate(selectedChat.created_at)}</small>
+                </div>
+              ) : (
+                <ol className="message-list" aria-label="Messages">
+                  {selectedMessages.map((message) => {
+                    const isOwn = message.senderUserId === user.id
+                    return (
+                      <li
+                        key={message.messageId}
+                        className={isOwn ? 'message own' : 'message received'}
+                      >
+                        <div>
+                          <p>{message.content}</p>
+                          <time dateTime={message.createdAt}>
+                            {formatMessageTime(message.createdAt)}
+                          </time>
+                        </div>
+                      </li>
+                    )
+                  })}
+                </ol>
+              )}
             </div>
+            <form className="message-composer" onSubmit={sendText}>
+              <label className="sr-only" htmlFor="message-draft">Message</label>
+              <textarea
+                id="message-draft"
+                name="message"
+                rows={2}
+                placeholder={`Message ${selectedChat.other_user.username}`}
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                disabled={sending}
+              />
+              <button type="submit" disabled={sending || !draft.trim()}>
+                {sending ? 'Sending...' : 'Send'}
+              </button>
+              {sendError && <p className="compact-error" role="alert">{sendError}</p>}
+            </form>
           </>
         ) : (
           <div className="chat-empty-state no-selection">
