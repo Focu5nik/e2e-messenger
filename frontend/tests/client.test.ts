@@ -280,3 +280,41 @@ test('structured API errors preserve the retryable delivery target code', async 
     },
   )
 })
+
+test('WebSocket auth shares memory tokens and refresh and reports logout immediately', async () => {
+  removeLockManager()
+  let refreshCount = 0
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url.endsWith('/auth/login')) return tokenResponse('initial-access')
+    if (url.endsWith('/auth/refresh')) { refreshCount += 1; return tokenResponse('fresh-access') }
+    if (url.endsWith('/auth/logout')) return new Response(null, { status: 204 })
+    throw new Error(`Unexpected request: ${url}`)
+  }
+  const client = new ApiClient()
+  await client.login('alice', 'password', { id: 'device', name: 'Browser' })
+  assert.equal(await client.getAccessToken(), 'initial-access')
+  const tokens = await Promise.all([client.getAccessToken(true), client.getAccessToken(true)])
+  assert.deepEqual(tokens, ['fresh-access', 'fresh-access'])
+  assert.equal(refreshCount, 1)
+  let cleared = false
+  const unsubscribe = client.onSessionCleared(() => { cleared = true })
+  const logout = client.logout()
+  assert.equal(cleared, true)
+  await logout
+  unsubscribe()
+})
+
+test('WebSocket token acquisition rejects a refresh that completes after logout', async () => {
+  removeLockManager()
+  let resolveRefresh: ((response: Response) => void) | undefined
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith('/auth/refresh')) return new Promise((resolve) => { resolveRefresh = resolve })
+    return new Response(null, { status: 204 })
+  }
+  const client = new ApiClient()
+  const token = client.getAccessToken()
+  await client.logout()
+  resolveRefresh?.(tokenResponse('stale-access'))
+  await assert.rejects(token, (error: unknown) => error instanceof ApiError && error.status === 401)
+})

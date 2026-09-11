@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { AuthenticatedShell } from '../features/account'
 import { AuthScreen, getDeviceIdentity, replaceDeviceIdentity } from '../features/auth'
+import { webSocketManager } from '../shared/api/webSocketManager'
 import {
   apiClient,
   checkBackendHealth,
@@ -54,6 +55,12 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (phase !== 'authenticated' || !user) return
+    webSocketManager.start()
+    return () => webSocketManager.stop()
+  }, [phase, user])
+
+  useEffect(() => {
     let active = true
     apiClient.setSessionExpiredHandler(() => {
       if (active) clearAuthenticatedState('Your session has ended. Please sign in again.')
@@ -100,6 +107,7 @@ function App() {
 
   return (
     <AuthenticatedShell
+      key={`${user.id}:${user.device_id}:${user.session_id}`}
       api={apiClient}
       user={user}
       devices={devices}

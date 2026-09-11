@@ -43,8 +43,12 @@ async def get_principal(
 ) -> Principal:
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise unauthorized()
+    return await authenticate_access_token(credentials.credentials, session)
+
+
+async def authenticate_access_token(token: str, session: AsyncSession) -> Principal:
     try:
-        claims = decode_access_token(credentials.credentials, get_settings())
+        claims = decode_access_token(token, get_settings())
     except AccessTokenError as exc:
         raise unauthorized() from exc
 
@@ -52,8 +56,8 @@ async def get_principal(
         await session.execute(
             select(User, Device, AuthSession)
             .select_from(AuthSession)
-            .join(Device, Device.id == AuthSession.device_id)
-            .join(User, User.id == Device.user_id)
+            .join(AuthSession.device)
+            .join(Device.user)
             .where(AuthSession.id == claims.session_id)
         )
     ).one_or_none()

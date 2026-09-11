@@ -162,6 +162,7 @@ export class ApiClient {
   private refreshTimer: number | null = null
   private sessionExpiredHandler: (() => void) | null = null
   private sessionRevision = 0
+  private sessionClearedHandlers = new Set<() => void>()
 
   constructor() {
     clearLegacyRefreshTokenStorage()
@@ -169,6 +170,26 @@ export class ApiClient {
 
   setSessionExpiredHandler(handler: () => void): void {
     this.sessionExpiredHandler = handler
+  }
+
+  onSessionCleared(handler: () => void): () => void {
+    this.sessionClearedHandlers.add(handler)
+    return () => { this.sessionClearedHandlers.delete(handler) }
+  }
+
+  getWebSocketUrl(): string {
+    const url = new URL(`${API_URL}/ws`, window.location.href)
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+    return url.toString()
+  }
+
+  async getAccessToken(refresh = false): Promise<string> {
+    const revision = this.sessionRevision
+    if (refresh || !this.accessToken) await this.refreshAccessToken()
+    if (revision !== this.sessionRevision || !this.accessToken) {
+      throw new ApiError('Your session has ended. Please sign in again.', 401)
+    }
+    return this.accessToken
   }
 
   async register(username: string, password: string): Promise<User> {
@@ -377,6 +398,7 @@ export class ApiClient {
     this.accessToken = null
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer)
     this.refreshTimer = null
+    for (const handler of this.sessionClearedHandlers) handler()
     if (notify) this.sessionExpiredHandler?.()
   }
 }

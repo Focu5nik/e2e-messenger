@@ -6,6 +6,8 @@ import {
   type DirectChat,
   type User,
 } from '../../../shared/api'
+import { webSocketManager } from '../../../shared/api/webSocketManager'
+import { mergeMessages, type DisplayMessage } from '../../messaging/lib/messageState'
 import {
   MessengerService,
   PlaintextMessageCodec,
@@ -38,11 +40,6 @@ function formatMessageTime(value: string): string {
   }).format(date)
 }
 
-type DisplayMessage = Pick<
-  ReceivedMessage,
-  'messageId' | 'chatId' | 'senderUserId' | 'content' | 'createdAt'
->
-
 function upsertChat(chats: DirectChat[], chat: DirectChat): DirectChat[] {
   const existingIndex = chats.findIndex((candidate) => candidate.id === chat.id)
   if (existingIndex === -1) return [chat, ...chats]
@@ -54,7 +51,7 @@ function upsertChat(chats: DirectChat[], chat: DirectChat): DirectChat[] {
 
 export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
   const messenger = useMemo(
-    () => new MessengerService(api, new PlaintextMessageCodec()),
+    () => new MessengerService(api, new PlaintextMessageCodec(), undefined, webSocketManager),
     [api],
   )
   const [chats, setChats] = useState<DirectChat[]>([])
@@ -74,6 +71,8 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState<string | null>(null)
   const selectionRequest = useRef(0)
+  const messageStage = useRef<HTMLDivElement>(null)
+  const messageDraft = useRef<HTMLTextAreaElement>(null)
 
   const selectChat = useCallback(async (chat: DirectChat) => {
     const request = selectionRequest.current + 1
@@ -106,7 +105,7 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
       .then((nextChats) => {
         if (!active) return
 
-        setChats(nextChats)
+        setChats((current) => current.reduce(upsertChat, nextChats))
         const lastChatId = localStorage.getItem(lastChatStorageKey(user.id))
         const lastChat = nextChats.find((chat) => chat.id === lastChatId)
 
@@ -131,22 +130,55 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
 
   useEffect(() => {
     let active = true
-
-    void messenger.loadMailbox()
-      .then(({ messages: receivedMessages }) => {
-        if (active) setMessages(receivedMessages)
-      })
-      .catch((error: unknown) => {
+    let loading = false
+    let reloadRequested = false
+    const discoveredChats = new Set<string>()
+    const receive = (receivedMessages: ReceivedMessage[]) => {
+      if (!active) return
+      setMessages((current) => mergeMessages(current, receivedMessages))
+      for (const message of receivedMessages) {
+        if (discoveredChats.has(message.chatId)) continue
+        discoveredChats.add(message.chatId)
+        void api.getChat(message.chatId).then((chat) => {
+          if (active) setChats((current) => upsertChat(current, chat))
+        }).catch((error: unknown) => {
+          discoveredChats.delete(message.chatId)
+          if (active) setChatsError(getErrorMessage(error))
+        })
+      }
+    }
+    const loadMailbox = async () => {
+      if (loading) { reloadRequested = true; return }
+      loading = true
+      try {
+        const result = await messenger.loadMailbox()
+        receive(result.messages)
+        if (active) setMailboxError(null)
+      } catch (error) {
         if (active) setMailboxError(getErrorMessage(error))
-      })
-      .finally(() => {
+      } finally {
+        loading = false
         if (active) setLoadingMailbox(false)
-      })
+        if (active && reloadRequested) {
+          reloadRequested = false
+          void loadMailbox()
+        }
+      }
+    }
+    const unsubscribe = messenger.subscribe(
+      (message) => receive([message]),
+      (error) => { if (active) setMailboxError(getErrorMessage(error)) },
+    )
+    // Reload after authentication to cover messages arriving during connection setup.
+    const unsubscribeReady = messenger.onReady(() => { void loadMailbox() })
+    void loadMailbox()
 
     return () => {
       active = false
+      unsubscribe()
+      unsubscribeReady()
     }
-  }, [messenger])
+  }, [api, messenger])
 
   async function findPeople(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -194,8 +226,7 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
 
     try {
       const accepted = await messenger.sendText(chat.id, content)
-      setMessages((current) => [
-        ...current.filter((message) => message.messageId !== accepted.id),
+      setMessages((current) => mergeMessages(current, [
         {
           messageId: accepted.id,
           chatId: accepted.chat_id,
@@ -203,7 +234,7 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
           content,
           createdAt: accepted.created_at,
         },
-      ])
+      ]))
       setDraft('')
     } catch (error) {
       setSendError(getErrorMessage(error))
@@ -212,9 +243,19 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
     }
   }
 
+  const selectedChatId = selectedChat?.id
   const selectedMessages = selectedChat
     ? messages.filter((message) => message.chatId === selectedChat.id)
     : []
+
+  useEffect(() => {
+    const stage = messageStage.current
+    if (stage) stage.scrollTop = stage.scrollHeight
+  }, [selectedChatId, selectedMessages.length])
+
+  useEffect(() => {
+    if (selectedChatId && !sending) messageDraft.current?.focus()
+  }, [selectedChatId, sending])
 
   return (
     <div className="chat-layout">
@@ -330,7 +371,7 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
               </div>
               <span className="secure-pill">Private</span>
             </header>
-            <div className="message-stage">
+            <div className="message-stage" ref={messageStage}>
               {mailboxError && (
                 <p className="message-status error" role="alert">
                   Could not load messages: {mailboxError}
@@ -369,12 +410,18 @@ export function ChatWorkspace({ api, user }: ChatWorkspaceProps) {
             <form className="message-composer" onSubmit={sendText}>
               <label className="sr-only" htmlFor="message-draft">Message</label>
               <textarea
+                ref={messageDraft}
                 id="message-draft"
                 name="message"
                 rows={2}
                 placeholder={`Message ${selectedChat.other_user.username}`}
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
+                  event.preventDefault()
+                  event.currentTarget.form?.requestSubmit()
+                }}
                 disabled={sending}
               />
               <button type="submit" disabled={sending || !draft.trim()}>

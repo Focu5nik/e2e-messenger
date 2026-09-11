@@ -116,9 +116,10 @@ export function AuthenticatedShell({
         </div>
       </header>
 
-      {view === 'chats' ? (
+      <div hidden={view !== 'chats'}>
         <ChatWorkspace api={api} user={user} />
-      ) : (
+      </div>
+      {view === 'account' && (
         <div className="content-grid">
           <aside className="profile-card" aria-labelledby="profile-heading">
             <div className="avatar" aria-hidden="true">{user.username.slice(0, 1).toUpperCase()}</div>

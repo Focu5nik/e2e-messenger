@@ -11,13 +11,18 @@ from app.chats.router import router as chats_router
 from app.config import get_settings
 from app.database import get_session
 from app.messages.router import router as messages_router
+from app.realtime.events import ConnectionRegistry, InMemoryEventBus
+from app.realtime.router import router as realtime_router
 
 settings = get_settings()
 api = FastAPI(title="Secure Messenger API", version="0.1.0")
+api.state.connection_registry = ConnectionRegistry()
+api.state.event_bus = InMemoryEventBus(api.state.connection_registry)
 
 api.include_router(auth_router)
 api.include_router(chats_router)
 api.include_router(messages_router)
+api.include_router(realtime_router)
 
 app = CORSMiddleware(
     app=api,
@@ -37,4 +42,3 @@ async def health(session: Annotated[AsyncSession, Depends(get_session)]) -> dict
             detail="database unavailable",
         ) from exc
     return {"status": "ok", "database": "ok"}
-

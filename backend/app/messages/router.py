@@ -1,5 +1,4 @@
 import uuid
-from datetime import UTC, datetime
 from typing import Annotated, TypeAlias
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -7,11 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import CurrentPrincipal
 from app.database import get_session
-from app.messages.models import Message, MessageEnvelope
+from app.messages.dependencies import Service
+from app.messages.responses import mailbox_response, message_response
 from app.messages.schemas import (
     DestinationDeviceResponse,
-    EnvelopeResponse,
-    MailboxEnvelopeResponse,
     MailboxPageResponse,
     MessageResponse,
     SendMessageRequest,
@@ -21,80 +19,11 @@ from app.messages.service import (
     DeliveryTargetsChangedError,
     DuplicateDestinationError,
     InvalidEnvelopeError,
-    MailboxPage,
-    MessageService,
-    StoredMessage,
 )
 
 
 router = APIRouter()
 DatabaseSession: TypeAlias = Annotated[AsyncSession, Depends(get_session)]
-
-
-def message_service() -> MessageService:
-    return MessageService()
-
-
-Service: TypeAlias = Annotated[MessageService, Depends(message_service)]
-
-
-def utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
-
-
-def envelope_response(envelope: MessageEnvelope) -> EnvelopeResponse:
-    return EnvelopeResponse(
-        id=envelope.id,
-        message_id=envelope.message_id,
-        recipient_device_id=envelope.recipient_device_id,
-        mailbox_seq=envelope.mailbox_seq,
-        protocol_version=envelope.protocol_version,
-        envelope_type=envelope.envelope_type,
-        payload=envelope.payload,
-        created_at=utc(envelope.created_at),
-        expires_at=utc(envelope.expires_at),
-        delivered_at=(utc(envelope.delivered_at) if envelope.delivered_at else None),
-        payload_purged_at=(
-            utc(envelope.payload_purged_at) if envelope.payload_purged_at else None
-        ),
-    )
-
-
-def message_response(stored: StoredMessage) -> MessageResponse:
-    message = stored.message
-    return MessageResponse(
-        id=message.id,
-        chat_id=message.chat_id,
-        sender_user_id=message.sender_user_id,
-        sender_device_id=message.sender_device_id,
-        client_message_id=message.client_message_id,
-        created_at=utc(message.created_at),
-        envelopes=[envelope_response(item) for item in stored.envelopes],
-    )
-
-
-def mailbox_response(page: MailboxPage) -> MailboxPageResponse:
-    responses: list[MailboxEnvelopeResponse] = []
-    for entry in page.entries:
-        envelope = envelope_response(entry.envelope)
-        message = entry.message
-        responses.append(
-            MailboxEnvelopeResponse(
-                **envelope.model_dump(),
-                chat_id=message.chat_id,
-                sender_user_id=message.sender_user_id,
-                sender_device_id=message.sender_device_id,
-                client_message_id=message.client_message_id,
-                message_created_at=utc(message.created_at),
-            )
-        )
-    return MailboxPageResponse(
-        envelopes=responses,
-        next_seq=page.next_seq,
-        has_more=page.has_more,
-    )
 
 
 @router.get(

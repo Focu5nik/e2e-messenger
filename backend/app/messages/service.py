@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import uuid
@@ -11,6 +12,7 @@ from app.auth.dependencies import Principal
 from app.auth.models import Device
 from app.messages.models import Message, MessageEnvelope
 from app.messages.repository import MessageRepository
+from app.messages.responses import mailbox_envelope_response
 from app.messages.schemas import (
     MAX_ENVELOPE_PAYLOAD_BYTES,
     PLAINTEXT_ENVELOPE_TYPE,
@@ -18,6 +20,7 @@ from app.messages.schemas import (
     ClientEnvelopeRequest,
     SendMessageRequest,
 )
+from app.realtime.events import EventBus
 
 
 PAYLOAD_RETENTION = timedelta(days=45)
@@ -63,8 +66,13 @@ class MailboxPage:
 
 
 class MessageService:
-    def __init__(self, repository: MessageRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: MessageRepository | None = None,
+        event_bus: EventBus | None = None,
+    ) -> None:
         self.repository = repository or MessageRepository()
+        self.event_bus = event_bus
 
     async def destination_devices(
         self,
@@ -176,7 +184,30 @@ class MessageService:
             if winning is None:
                 raise
             return StoredMessage(*winning)
-        return StoredMessage(message=message, envelopes=envelopes)
+        stored = StoredMessage(message=message, envelopes=envelopes)
+        await self._publish(stored)
+        return stored
+
+    async def _publish(self, stored: StoredMessage) -> None:
+        if self.event_bus is None:
+            return
+
+        # The database commit is authoritative. A slow or broken socket must not
+        # turn an accepted send into a failed command or delay other recipients.
+        async def publish(envelope: MessageEnvelope) -> None:
+            try:
+                response = mailbox_envelope_response(envelope, stored.message)
+                await asyncio.wait_for(
+                    self.event_bus.publish(
+                        envelope.recipient_device_id,
+                        {"type": "message.new", "data": response.model_dump(mode="json")},
+                    ),
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+        await asyncio.gather(*(publish(item) for item in stored.envelopes))
 
     @staticmethod
     def _validate_envelope(envelope: ClientEnvelopeRequest) -> bytes:

@@ -317,8 +317,10 @@ form input:hover { border-color: #a8bbb2; }
 .chat-layout {
   display: grid;
   grid-template-columns: minmax(300px, 350px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   width: min(1280px, calc(100% - 48px));
-  min-height: min(760px, calc(100vh - 118px));
+  height: min(760px, calc(100vh - 118px));
+  height: min(760px, calc(100dvh - 118px));
   margin: 24px auto;
   overflow: hidden;
   border: 1px solid #dce5e0;
@@ -532,7 +534,9 @@ form input:hover { border-color: #a8bbb2; }
 .chat-stage {
   display: flex;
   min-width: 0;
+  min-height: 0;
   flex-direction: column;
+  overflow: hidden;
   background:
     radial-gradient(circle at 88% 15%, rgb(126 211 172 / 12%), transparent 22rem),
     #fff;
@@ -911,8 +915,9 @@ form input:hover { border-color: #a8bbb2; }
 
   .chat-layout {
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto;
     width: min(100% - 28px, 620px);
-    min-height: 0;
+    height: auto;
     margin: 14px auto 24px;
   }
 
@@ -923,9 +928,13 @@ form input:hover { border-color: #a8bbb2; }
 
   .chat-list { max-height: 260px; }
 
-  .chat-stage { min-height: 390px; }
+  .chat-stage {
+    height: min(760px, calc(100vh - 28px));
+    height: min(760px, calc(100dvh - 28px));
+    min-height: 390px;
+  }
 
-  .message-stage { min-height: 300px; }
+  .message-stage { min-height: 0; }
 }
 
 @media (max-width: 500px) {
