@@ -8,20 +8,37 @@ account-scoped device identity, one-to-one chats, and WebSocket message delivery
 Requirements: Docker, Node.js/npm, and [uv](https://docs.astral.sh/uv/).
 
 ```powershell
-Copy-Item .env.example .env
-docker compose up -d postgres
+Copy-Item backend/.env.example backend/.env
+Copy-Item client/web/.env.example client/web/.env
+Copy-Item infra/.env.example infra/.env
+npm run infra:up
 uv sync --project backend --dev
-npm install --prefix frontend
+npm install
 npm run migrate
 ```
 
-Before starting the backend, replace the example `JWT_SECRET` with a unique random
+Run npm installs from the repository root. The root `package-lock.json` is the
+canonical lockfile for the `client/web` and `client/packages/*` workspaces; use `npm ci`
+for a clean, reproducible install. The frontend depends on the local
+`@secure-messenger/client-core` package in `client/packages/client-core`. Its TypeScript
+entry point exports the shared session/chat stores, messaging and identity services,
+domain models, protocol contracts, and platform ports. See the
+[client architecture](client/packages/client-core/README.md) for ownership, the public
+API, and future native adapter requirements, and the
+[acceptance results](client/ACCEPTANCE.md) for final refactor verification.
+
+Before starting the backend, replace the example `JWT_SECRET` in `backend/.env` with a unique random
 value of at least 32 characters. Never reuse the example value outside local
 development.
 
 Docker publishes the project database on host port `5433` by default, while
 PostgreSQL continues to use port `5432` inside the container. Override
-`POSTGRES_PORT` and the matching port in `DATABASE_URL` together if needed.
+`POSTGRES_PORT` in `infra/.env` and the matching port in `DATABASE_URL` in
+`backend/.env` together if needed. Database names and credentials must also match.
+
+`npm run infra:down` stops the Compose services and preserves the database volume.
+Direct Docker commands use `docker compose --env-file infra/.env -f infra/compose.yaml`.
+The Compose project name remains `messenger`, preserving `messenger_postgres_data`.
 
 Run the backend and frontend in separate terminals:
 
@@ -30,9 +47,12 @@ npm run dev:backend
 npm run dev:frontend
 ```
 
-Open the URL configured by `FRONTEND_ORIGIN` in `.env`. Vite uses the same setting
-for its host and port and exits if that port is already occupied, preventing a CORS
-origin mismatch. You can register, sign in on the persistent browser device, find
+Open the URL configured by `FRONTEND_ORIGIN` in `client/web/.env`. Vite uses it
+for its host and port and exits if that port is already occupied. Keep
+`FRONTEND_ORIGIN` in `backend/.env` equal to that web origin for HTTP and WebSocket
+authorization. `VITE_API_URL` in `client/web/.env` points to the backend. The backend
+starts at `127.0.0.1:8000` by default; use Uvicorn's `--host` and `--port` flags
+when overriding it. You can register, sign in on the persistent browser device, find
 active users, open a unique direct chat, switch chats, inspect account devices,
 revoke a device, exchange messages in real time, and sign out.
 
@@ -115,6 +135,23 @@ existing HTTP mailbox available after reload. Durable local storage, offline syn
 and delivery acknowledgements belong to later versions. Unacknowledged payloads
 retain the existing 45-day expiry and metadata-only tombstones.
 
+## Repository layout
+
+```text
+client/
+  web/                    # React web app, Vite/TypeScript config, public env settings
+  packages/client-core/   # Shared client package; future mobile app goes in client/mobile
+backend/                  # Python app, tests, migrations, backend env settings
+infra/                    # PostgreSQL Compose configuration and container env settings
+package.json              # npm workspaces and repository commands
+package-lock.json         # Canonical npm lockfile
+```
+
+Each application loads its own `.env`; there is no root `.env`. The backend resolves
+its file relative to `backend/app/config.py`, so launching from the root or backend
+directory uses the same settings. Real `.env` files are ignored by Git; commit only
+the `.env.example` templates. Browser-exposed `VITE_*` settings must contain no secrets.
+
 ## Backend layout
 
 ```text
@@ -136,7 +173,15 @@ implemented.
 
 ```powershell
 npm test
-npm --prefix frontend run lint
+npm run lint --workspace client/web
+```
+
+To check only the JavaScript/TypeScript workspaces:
+
+```powershell
+npm run typecheck:core
+npm run test:core
+npm run test:frontend
 ```
 
 To include PostgreSQL locking and concurrency tests, migrate an isolated test

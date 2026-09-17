@@ -1,15 +1,21 @@
 {
   "name": "secure-messenger",
   "private": true,
+  "workspaces": [
+    "client/web",
+    "client/packages/*"
+  ],
   "scripts": {
     "dev:backend": "uv run --project backend uvicorn app.main:app --reload --app-dir backend",
-    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:frontend": "npm run dev --workspace client/web",
+    "infra:up": "docker compose --env-file infra/.env -f infra/compose.yaml up -d postgres",
+    "infra:down": "docker compose --env-file infra/.env -f infra/compose.yaml down",
     "migrate": "uv run --project backend alembic -c backend/alembic.ini upgrade head",
     "test:backend": "uv run --project backend pytest backend/tests",
-    "test:frontend": "npm --prefix frontend run test && npm --prefix frontend run build",
-    "test": "npm run test:backend && npm run test:frontend"
-  },
-  "devDependencies": {
-    "@types/node": "^26.4.1"
+    "test:frontend": "npm run test --workspace client/web && npm run build --workspace client/web",
+    "test:core": "npm run test --workspace @secure-messenger/client-core",
+    "typecheck:core": "npm run typecheck --workspace @secure-messenger/client-core",
+    "check:architecture": "node client/scripts/check-architecture.mjs",
+    "test": "npm run typecheck:core && npm run test:core && npm run test:backend && npm run test:frontend"
   }
 }

@@ -5,11 +5,13 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 backend/.coverage
-frontend/dist/
-frontend/node_modules/
+client/web/dist/
+client/web/node_modules/
 .vscode/
+dev-docs/
 AGENTS.md 
 DEV_PLAN.md 
+V4_REF_PLAN.md 
 
 logs
 *.log
