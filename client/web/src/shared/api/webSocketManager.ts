@@ -1,4 +1,4 @@
-import type { ClientEvent, MailboxEnvelope, RealtimeGateway, SendMessageRequest, SentMessage } from '@secure-messenger/client-core'
+import type { ClientEvent, MailboxEnvelope, MailboxPage, RealtimeGateway, SendMessageRequest, SentMessage } from '@secure-messenger/client-core'
 import { mapServerEvent } from './mappers.ts'
 import { ApiError } from './errors.ts'
 
@@ -13,6 +13,7 @@ type PendingSend = {
   reject: (error: Error) => void
   timer: number
 }
+type PendingSync = { resolve: (page: MailboxPage) => void; reject: (error: Error) => void; timer: number }
 
 export class WebSocketManager implements RealtimeGateway {
   private readonly auth: SocketAuth
@@ -28,6 +29,7 @@ export class WebSocketManager implements RealtimeGateway {
   private messageHandlers = new Set<(envelope: MailboxEnvelope) => void>()
   private readyHandlers = new Set<() => void>()
   private pending = new Map<string, PendingSend>()
+  private pendingSync = new Map<string, PendingSync>()
 
   constructor(auth: SocketAuth, createSocket = (url: string) => new WebSocket(url)) {
     this.auth = auth
@@ -90,6 +92,25 @@ export class WebSocketManager implements RealtimeGateway {
     })
   }
 
+  getMailbox(afterSeq: number, limit = 100): Promise<MailboxPage> {
+    if (!this.ready) return Promise.reject(new ApiError('Real-time connection is unavailable.', 0))
+    const requestId = crypto.randomUUID()
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        this.pendingSync.delete(requestId)
+        reject(new ApiError('Mailbox sync timed out. Reconnect to try again.', 0))
+      }, 15_000)
+      this.pendingSync.set(requestId, { resolve, reject, timer })
+      try {
+        this.socket!.send(JSON.stringify({ type: 'sync.request', request_id: requestId, data: { after_seq: afterSeq, limit } } satisfies ClientEvent))
+      } catch {
+        window.clearTimeout(timer)
+        this.pendingSync.delete(requestId)
+        reject(new ApiError('Connection lost during mailbox sync.', 0))
+      }
+    })
+  }
+
   private async connect(refresh: boolean): Promise<void> {
     const generation = ++this.generation
     try {
@@ -117,6 +138,13 @@ export class WebSocketManager implements RealtimeGateway {
           for (const handler of this.readyHandlers) handler()
         } else if (this.authenticated && frame.type === 'message.new' && frame.data) {
           for (const handler of this.messageHandlers) handler(frame.data)
+        } else if (this.authenticated && (frame.type === 'sync.response' || frame.type === 'error')
+          && frame.request_id && this.pendingSync.has(frame.request_id)) {
+          const pending = this.pendingSync.get(frame.request_id)!
+          this.pendingSync.delete(frame.request_id)
+          window.clearTimeout(pending.timer)
+          if (frame.type === 'sync.response') pending.resolve(frame.data)
+          else pending.reject(new ApiError(frame.error.message, frame.error.status, frame.error.code))
         } else if (this.authenticated && (frame.type === 'message.accepted' || frame.type === 'error')) {
           const requestId = frame.request_id
           const pending = requestId ? this.pending.get(requestId) : undefined
@@ -161,6 +189,11 @@ export class WebSocketManager implements RealtimeGateway {
   }
 
   private rejectPending(): void {
+    for (const pending of this.pendingSync.values()) {
+      window.clearTimeout(pending.timer)
+      pending.reject(new ApiError('Connection lost during mailbox sync.', 0))
+    }
+    this.pendingSync.clear()
     for (const pending of this.pending.values()) {
       window.clearTimeout(pending.timer)
       pending.reject(new ApiError('Connection lost. Message delivery is unconfirmed.', 0, null, 'delivery_unconfirmed'))

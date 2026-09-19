@@ -1,4 +1,5 @@
 import type { DeviceIdentity } from '../domain/models.ts'
+import { ClientError } from '../domain/errors.ts'
 import type { DeviceDescription, DeviceIdentityStore, IdGenerator } from '../ports/platform.ts'
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -38,7 +39,15 @@ export class DeviceIdentityService {
 
   private async create(): Promise<DeviceIdentity> {
     const identity = { id: this.createId(), name: await this.describeDevice() }
-    await this.store.write(identity)
+    try {
+      await this.store.write(identity)
+    } catch (error) {
+      // Another browser tab may have initialized/replaced this generation first.
+      if (!(error instanceof ClientError) || error.code !== 'local_generation_changed') throw error
+      const winner = await this.store.read()
+      if (isDeviceIdentity(winner) && winner.id !== identity.id) return winner
+      throw error
+    }
     return identity
   }
 

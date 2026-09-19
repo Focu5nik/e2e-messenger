@@ -206,12 +206,14 @@ test('messenger pages the mailbox, decodes live envelopes, and advances over tom
     },
   }
 
+  const expectedEnvelopes = pages.flatMap((page) => page.envelopes)
   const result = await new MessengerService(api, codec, createId).loadMailbox()
 
   assert.deepEqual(requestedCursors, [0, 2])
   assert.deepEqual(result.messages.map((message) => message.content), ['one', 'three'])
   assert.equal(result.tombstoneCount, 1)
   assert.equal(result.nextSeq, 3)
+  assert.deepEqual(result.envelopes, expectedEnvelopes)
 })
 
 test('messenger retries only delivery-target changes and stops after one retry', async () => {
@@ -383,7 +385,7 @@ test('empty final mailbox pages preserve the starting cursor', async () => {
     async getMailbox(afterSeq) { return { envelopes: [], nextSeq: afterSeq, hasMore: false } },
   }
   const messenger = new MessengerService(api, codec, createId)
-  assert.deepEqual(await messenger.loadMailbox(7), { messages: [], nextSeq: 7, tombstoneCount: 0 })
+  assert.deepEqual(await messenger.loadMailbox(7), { messages: [], envelopes: [], nextSeq: 7, tombstoneCount: 0 })
   messenger.subscribe(() => assert.fail('Unexpected message'), () => assert.fail('Unexpected error'))()
   messenger.onReady(() => assert.fail('Unexpected ready event'))()
 })

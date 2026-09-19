@@ -103,11 +103,10 @@ async def test_bidirectional_delivery_http_send_and_no_ack(client, session_facto
         # A retry returns the same metadata without creating another live event.
         await alice_ws.send({"type": "message.send", "request_id": "retry", "data": request})
         assert (await alice_ws.event())["data"]["id"] == accepted["data"]["id"]
-        for event_type in ("message.delivered", "sync.request"):
-            await bob_ws.send({"type": event_type, "request_id": event_type, "data": {"envelope_id": incoming["data"]["id"]}})
-            error = await bob_ws.event()
-            assert error["error"]["code"] == "unsupported_event"
-            assert error["request_id"] == event_type
+        await bob_ws.send({"type": "message.delivered", "request_id": "ack", "data": {"envelope_id": incoming["data"]["id"]}})
+        error = await bob_ws.event()
+        assert error["error"]["code"] == "unsupported_event"
+        assert error["request_id"] == "ack"
         response = await client.post("/messages", headers=bearer(alice_token), json=send_body(chat.id, bob_devices))
         assert response.status_code == 201
         assert (await bob_ws.event())["data"]["message_id"] == response.json()["id"]
@@ -318,8 +317,11 @@ async def test_each_online_device_receives_only_its_own_opaque_envelope(client, 
             assert event["data"]["payload"] == request["envelopes"][index]["payload"]
             assert event["data"]["mailbox_seq"] == 1
             # A request/reply boundary detects any extra queued envelope.
-            await socket.send({"type": "sync.request"})
-            assert (await socket.event())["error"]["code"] == "unsupported_event"
+            await socket.send({"type": "sync.request", "request_id": "scope", "data": {}})
+            page = await socket.event()
+            assert page["type"] == "sync.response"
+            assert page["request_id"] == "scope"
+            assert page["data"]["envelopes"] == [event["data"]]
 
 
 async def test_websocket_accepts_same_large_envelope_array_as_http(client, session_factory):

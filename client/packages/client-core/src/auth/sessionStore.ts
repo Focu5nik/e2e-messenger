@@ -8,6 +8,7 @@ export type SessionStoreDependencies = {
   session: SessionGateway
   account: AccountGateway
   identities: Pick<DeviceIdentityService, 'get' | 'replace'>
+  prepareInbox?: (user: CurrentUser) => Promise<void>
 }
 
 export type SessionState = {
@@ -36,7 +37,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
 }
 
-export function createSessionStore({ session, account, identities }: SessionStoreDependencies) {
+export function createSessionStore({ session, account, identities, prepareInbox }: SessionStoreDependencies) {
   let active = false
   let generation = 0
   let devicesRevision = 0
@@ -55,6 +56,12 @@ export function createSessionStore({ session, account, identities }: SessionStor
 
     async function loadAccount(operation: number) {
       const [user, devices] = await Promise.all([account.getCurrentUser(), account.getDevices()])
+      if (!isCurrent(operation)) return
+      if (user.deviceId !== get().deviceIdentity?.id) {
+        await session.logout()
+        throw new Error('Local message storage changed. Please sign in again to register this device.')
+      }
+      await prepareInbox?.(user)
       if (isCurrent(operation)) set({ user, devices, authError: null, phase: 'authenticated' })
     }
 
@@ -70,7 +77,7 @@ export function createSessionStore({ session, account, identities }: SessionStor
           if (!isCurrent(operation)) return false
           registered = true
         }
-        const device = get().deviceIdentity ?? await identities.get()
+        const device = await identities.get()
         if (!isCurrent(operation)) return false
         set({ deviceIdentity: device })
         try {

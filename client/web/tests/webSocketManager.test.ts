@@ -23,6 +23,45 @@ const command: SendMessageRequest = {
   envelopes: [{ recipient_device_id: 'device-1', protocol_version: 0, envelope_type: 'PLAINTEXT', payload: 'aGk=' }],
 }
 
+test('sync requests correlate validated pages independently from message sends', async () => {
+  const { manager, sockets } = setup()
+  await assert.rejects(manager.getMailbox(0), /unavailable/)
+  manager.start()
+  await Promise.resolve()
+  const socket = sockets[0]
+  socket.open()
+  socket.receive({ type: 'auth.ok' })
+  const syncing = manager.getMailbox(4, 25)
+  const request = JSON.parse(socket.sent[1])
+  assert.equal(request.type, 'sync.request')
+  assert.deepEqual(request.data, { after_seq: 4, limit: 25 })
+  socket.receive({ type: 'sync.response', request_id: request.request_id, data: { envelopes: [], next_seq: 'invalid', has_more: false } })
+  socket.receive({ type: 'message.accepted', request_id: request.request_id, data: sentMessageDto })
+  socket.receive({ type: 'sync.response', request_id: 'other', data: { envelopes: [], next_seq: 99, has_more: false } })
+  socket.receive({ type: 'sync.response', request_id: request.request_id, data: { envelopes: [], next_seq: 4, has_more: false } })
+  assert.deepEqual(await syncing, { envelopes: [], nextSeq: 4, hasMore: false })
+  manager.stop()
+})
+
+test('sync errors, timeouts and disconnects reject pending pages and clear timers', async () => {
+  for (const failure of ['error', 'timeout', 'disconnect'] as const) {
+    const { manager, sockets, timers, runTimer } = setup()
+    manager.start()
+    await Promise.resolve()
+    sockets[0].open()
+    sockets[0].receive({ type: 'auth.ok' })
+    const syncing = manager.getMailbox(0)
+    if (failure === 'error') {
+      const { request_id } = JSON.parse(sockets[0].sent[1])
+      sockets[0].receive({ type: 'error', request_id, error: { code: 'invalid_event', message: 'Invalid sync request', status: 422 } })
+    } else if (failure === 'timeout') runTimer(15_000)
+    else manager.stop()
+    await assert.rejects(syncing)
+    manager.stop()
+    assert.equal(timers.size, 0)
+  }
+})
+
 function setup() {
   const timers = new Map<number, { handler: () => void; delay: number }>()
   let timerId = 0

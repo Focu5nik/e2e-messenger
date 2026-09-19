@@ -1,5 +1,5 @@
 import { createStore } from 'zustand/vanilla'
-import type { DirectChat, DisplayMessage, ReceivedMessage, User } from '../domain/models.ts'
+import type { DirectChat, DisplayMessage, User } from '../domain/models.ts'
 import type { ChatGateway } from '../ports/gateways.ts'
 import type { MessengerService } from '../messaging/messengerService.ts'
 import { mergeMessages } from '../messaging/messageState.ts'
@@ -8,6 +8,7 @@ import type { ChatPreferencesService } from './chatPreferences.ts'
 export type ChatStoreDependencies = {
   chats: ChatGateway
   messenger: Pick<MessengerService, 'loadMailbox' | 'subscribe' | 'onReady' | 'sendText'>
+    & Partial<Pick<MessengerService, 'restoreLocal' | 'cacheChats'>>
   preferences: Pick<ChatPreferencesService, 'restore' | 'select'>
 }
 
@@ -76,14 +77,19 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
   let run: ChatRun | null = null
 
   return createStore<ChatState>()((set, get) => {
-    function receive(current: ChatRun, messages: ReceivedMessage[]) {
+    function receive(current: ChatRun, messages: DisplayMessage[]) {
       if (run !== current) return
       set((state) => ({ messages: mergeMessages(state.messages, messages) }))
       for (const message of messages) {
         if (current.discoveredChats.has(message.chatId)) continue
         current.discoveredChats.add(message.chatId)
         void gateway.getChat(message.chatId).then((chat) => {
-          if (run === current) set((state) => ({ chats: upsertChat(state.chats, chat) }))
+          if (run === current) {
+            set((state) => ({ chats: upsertChat(state.chats, chat) }))
+            void messenger.cacheChats?.([chat]).catch((error: unknown) => {
+              if (run === current) set({ chatsError: errorMessage(error) })
+            })
+          }
         }).catch((error: unknown) => {
           current.discoveredChats.delete(message.chatId)
           if (run === current) set({ chatsError: errorMessage(error) })
@@ -119,6 +125,8 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         const chats = await gateway.getChats()
         if (run !== current) return
         set((state) => ({ chats: state.chats.reduce(upsertChat, chats), loadingChats: false }))
+        await messenger.cacheChats?.(chats)
+        if (run !== current) return
         if (request !== current.selection) return
         const lastChat = await preferences.restore(current.userId, chats)
         if (run !== current || request !== current.selection) return
@@ -147,6 +155,20 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         )
         // Cover messages arriving during connection setup and reconnects.
         current.unsubscribeReady = messenger.onReady(() => { void loadMailbox(current) })
+        if (messenger.restoreLocal) {
+          try {
+            const local = await messenger.restoreLocal()
+            if (run !== current) return
+            set((state) => ({ chats: state.chats.reduce(upsertChat, local.chats), messages: mergeMessages(state.messages, local.messages) }))
+            for (const chat of local.chats) current.discoveredChats.add(chat.id)
+            const selectedChat = local.chats.length ? await preferences.restore(userId, local.chats) : null
+            if (run !== current) return
+            if (current.selection === 0) set({ selectedChat })
+          } catch (error) {
+            if (run === current) set({ mailboxError: errorMessage(error) })
+          }
+        }
+        if (run !== current) return
         await Promise.all([loadChats(current), loadMailbox(current)])
       },
 

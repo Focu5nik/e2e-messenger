@@ -18,7 +18,7 @@ from app.auth.dependencies import authenticate_access_token
 from app.config import get_settings
 from app.database import get_session
 from app.messages.dependencies import Service
-from app.messages.responses import message_response
+from app.messages.responses import mailbox_response, message_response
 from app.messages.schemas import SendMessageRequest
 from app.messages.service import (
     ChatNotFoundError,
@@ -45,6 +45,19 @@ class SendEvent(BaseModel):
     type: Literal["message.send"]
     request_id: str = Field(min_length=1, max_length=128)
     data: SendMessageRequest
+
+
+class SyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    after_seq: int = Field(default=0, ge=0, le=2**63 - 1)
+    limit: int = Field(default=100, ge=1, le=100)
+
+
+class SyncEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["sync.request"]
+    request_id: str = Field(min_length=1, max_length=128)
+    data: SyncRequest
 
 
 def session_provider(connection: HTTPConnection):
@@ -124,7 +137,22 @@ async def websocket_endpoint(
             # a current session; they cannot keep a revoked connection alive.
             async with sessions() as session:
                 current = await authenticate_access_token(auth.access_token, session)
-                if event.get("type") != "message.send":
+                if event.get("type") == "sync.request":
+                    try:
+                        command = SyncEvent.model_validate(event)
+                        page = await service.mailbox(
+                            session, current, command.data.after_seq, command.data.limit
+                        )
+                        response = {
+                            "type": "sync.response", "request_id": command.request_id,
+                            "data": mailbox_response(page).model_dump(mode="json"),
+                        }
+                    except ValidationError:
+                        response = error_event(
+                            "invalid_event", "Invalid sync.request data.", 422,
+                            event.get("request_id"),
+                        )
+                elif event.get("type") != "message.send":
                     response = error_event(
                         "unsupported_event", "Event is not supported in this version.",
                         400, event.get("request_id"),

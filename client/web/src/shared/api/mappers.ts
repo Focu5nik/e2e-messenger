@@ -191,14 +191,17 @@ export function mapError(value: unknown, fallback: string): { message: string; c
 
 // Validate realtime data at the same boundary as HTTP, before notifying callers.
 export function mapServerEvent(value: unknown):
-  | Exclude<ServerEvent, { type: 'message.accepted' }>
-  | { type: 'message.accepted'; request_id: string; data: SentMessage } {
+  | Exclude<ServerEvent, { type: 'message.accepted' | 'sync.response' }>
+  | { type: 'message.accepted'; request_id: string; data: SentMessage }
+  | { type: 'sync.response'; request_id: string; data: MailboxPage } {
   const dto = object(value)
   switch (dto.type) {
     case 'auth.ok': return { type: dto.type }
     case 'message.new': return { type: dto.type, data: mapMailboxEnvelope(dto.data) }
     case 'message.accepted':
       return { type: dto.type, request_id: string(dto.request_id, 'request_id'), data: mapSentMessage(dto.data) }
+    case 'sync.response':
+      return { type: dto.type, request_id: string(dto.request_id, 'request_id'), data: mapMailboxPage(dto.data) }
     case 'error': {
       const error = object(dto.error)
       return {

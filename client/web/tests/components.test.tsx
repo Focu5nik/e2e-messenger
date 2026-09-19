@@ -6,7 +6,7 @@ import type { CurrentUserDto, DeviceDto, DeviceIdentity, DirectChatDto, MailboxE
 import { mailboxEnvelopeDto, sentMessageDto } from './apiFixtures.ts'
 import { browserDeviceDescription } from '../src/shared/platform/deviceDescription.ts'
 import { browserIdGenerator, browserTextEncoding } from '../src/shared/platform/messaging.ts'
-import { browserChatPreferencesStore, browserDeviceIdentityStore } from '../src/shared/platform/storage.ts'
+import { browserChatPreferencesStore } from '../src/shared/platform/storage.ts'
 
 // Install the DOM before loading React DOM so its event system detects a browser.
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {
@@ -53,6 +53,11 @@ let root: ReturnType<typeof createRoot>
 let starts: number
 let stops: number
 let realtime: RealtimeGateway
+let storedIdentity: DeviceIdentity
+const identityStore = {
+  async read() { return storedIdentity },
+  async write(value: DeviceIdentity) { storedIdentity = { ...value } },
+}
 let identities: DeviceIdentityService
 let preferences: ChatPreferencesService
 let messageHandlers: Set<(envelope: MailboxEnvelope) => void>
@@ -69,7 +74,8 @@ function errorResponse(detail: string, status: number): Response {
 function defaultResponse({ path, init }: Request): Response {
   if (path === '/health') return Response.json({ status: 'ok' })
   if (path === '/auth/refresh' || path === '/auth/login') return tokens()
-  if (path === '/auth/register' || path === '/me') return Response.json(user)
+  if (path === '/auth/register') return Response.json(user)
+  if (path === '/me') return Response.json({ ...user, device_id: loginBodies().at(-1)?.device_id ?? user.device_id })
   if (path === '/auth/logout' || (path.startsWith('/devices/') && init.method === 'DELETE')) {
     return new Response(null, { status: 204 })
   }
@@ -85,12 +91,12 @@ function defaultResponse({ path, init }: Request): Response {
 
 beforeEach(() => {
   localStorage.clear()
-  localStorage.setItem('messenger.device', JSON.stringify(identity))
+  storedIdentity = { ...identity }
   requests = []
   respond = () => undefined
   starts = 0
   stops = 0
-  identities = new DeviceIdentityService(browserDeviceIdentityStore, browserIdGenerator, browserDeviceDescription)
+  identities = new DeviceIdentityService(identityStore, browserIdGenerator, browserDeviceDescription)
   preferences = new ChatPreferencesService(browserChatPreferencesStore)
   // Inject an in-memory gateway; no browser socket is needed by the components.
   messageHandlers = new Set()
@@ -227,7 +233,7 @@ test('the composer preserves Enter, Shift+Enter and composition handling and scr
 
 test('App waits for device identity storage before restoring the session', async () => {
   let resolveRead!: (value: unknown) => void
-  mock.method(browserDeviceIdentityStore, 'read', () => new Promise((resolve) => { resolveRead = resolve }))
+  mock.method(identityStore, 'read', () => new Promise((resolve) => { resolveRead = resolve }))
   await renderApp()
   assert.match(container.textContent!, /Restoring your secure session/)
   assert.equal(requests.some(({ path }) => path === '/auth/refresh'), false)
@@ -237,7 +243,7 @@ test('App waits for device identity storage before restoring the session', async
 
 test('an identity read completing after unmount does not restore a session', async () => {
   let resolveRead!: (value: unknown) => void
-  mock.method(browserDeviceIdentityStore, 'read', () => new Promise((resolve) => { resolveRead = resolve }))
+  mock.method(identityStore, 'read', () => new Promise((resolve) => { resolveRead = resolve }))
   await renderApp()
   await act(async () => root.render(null))
   await act(async () => resolveRead(identity))
@@ -248,9 +254,9 @@ test('an identity read completing after unmount does not restore a session', asy
 test('revoked-device recovery waits for replacement persistence before retrying login', async () => {
   respond = anonymousRestore
   await renderApp()
-  const write = browserDeviceIdentityStore.write
+  const write = identityStore.write
   let releaseWrite!: () => void
-  mock.method(browserDeviceIdentityStore, 'write', async (value: DeviceIdentity) => {
+  mock.method(identityStore, 'write', async (value: DeviceIdentity) => {
     await new Promise<void>((resolve) => { releaseWrite = resolve })
     await write(value)
   })
@@ -258,10 +264,10 @@ test('revoked-device recovery waits for replacement persistence before retrying 
     ? errorResponse('device is revoked', 403) : undefined
   await submitCredentials()
   assert.equal(loginBodies().length, 1)
-  assert.equal(JSON.parse(localStorage.getItem('messenger.device')!).id, identity.id)
+  assert.equal(storedIdentity.id, identity.id)
   await act(async () => releaseWrite())
   assert.equal(loginBodies().length, 2)
-  assert.equal(loginBodies()[1].device_id, JSON.parse(localStorage.getItem('messenger.device')!).id)
+  assert.equal(loginBodies()[1].device_id, storedIdentity.id)
   assert.notEqual(loginBodies()[1].device_id, identity.id)
   assert.ok(container.querySelector('.shell'))
 })
@@ -544,7 +550,7 @@ test('revoked-device login replaces the persisted identity and retries once befo
   const attempts = loginBodies()
   assert.equal(attempts.length, 2)
   assert.equal(attempts[0].device_id, identity.id)
-  const replacement = JSON.parse(localStorage.getItem('messenger.device')!)
+  const replacement = storedIdentity
   assert.notEqual(replacement.id, identity.id)
   assert.deepEqual(attempts[1], {
     username: 'alice', password: 'test-password', device_id: replacement.id, device_name: replacement.name,
@@ -567,7 +573,7 @@ test('revoked-device recovery uses a core error code regardless of message or tr
   })
   await submitCredentials()
   assert.equal(attempts, 2)
-  assert.notEqual(JSON.parse(localStorage.getItem('messenger.device')!).id, identity.id)
+  assert.notEqual(storedIdentity.id, identity.id)
   assert.ok(container.querySelector('.shell'))
 })
 
@@ -577,7 +583,7 @@ for (const [status, detail] of [[401, 'Invalid credentials'], [403, 'Account dis
     await renderApp()
     await submitCredentials()
     assert.equal(loginBodies().length, 1)
-    assert.deepEqual(JSON.parse(localStorage.getItem('messenger.device')!), identity)
+    assert.deepEqual(storedIdentity, identity)
     assert.equal(element('[role="alert"]').textContent, detail)
     assert.equal(element<HTMLButtonElement>('button[type="submit"]').disabled, false)
     assert.equal(starts, 0)

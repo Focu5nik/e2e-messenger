@@ -1,5 +1,6 @@
 export type ClientErrorCode =
   | 'device_revoked'
+  | 'local_generation_changed'
   | 'delivery_targets_changed'
   | 'no_recipient_devices'
   | 'session_expired'

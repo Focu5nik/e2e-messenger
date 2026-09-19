@@ -114,7 +114,7 @@ test('login normalizes only the username, loads the account, and never stores cr
   await store.getState().restore()
   calls.length = 0
   await store.getState().login('  alice  ', ' test-password ')
-  assert.deepEqual(calls, [`login:${identity.id}`, 'user', 'devices'])
+  assert.deepEqual(calls, ['identity', `login:${identity.id}`, 'user', 'devices'])
   assert.equal(store.getState().phase, 'authenticated')
   assert.equal(store.getState().submitting, false)
   assert.doesNotMatch(JSON.stringify(store.getState()), /test-password/)
@@ -131,7 +131,7 @@ test('login failure does not replace identity or load account and allows a retry
   assert.equal(store.getState().authError, 'Invalid credentials')
   assert.equal(store.getState().submitting, false)
   assert.equal(store.getState().phase, 'anonymous')
-  assert.deepEqual(calls, ['identity', 'restore'])
+  assert.deepEqual(calls, ['identity', 'restore', 'identity'])
   store.getState().clearAuthError()
   assert.equal(store.getState().authError, null)
   session.login = login
@@ -144,7 +144,7 @@ test('registration reports success, logs in once, and loads the account in order
   await store.getState().restore()
   calls.length = 0
   assert.equal(await store.getState().register('  alice  ', ' test-password '), true)
-  assert.deepEqual(calls, ['register', `login:${identity.id}`, 'user', 'devices'])
+  assert.deepEqual(calls, ['register', 'identity', `login:${identity.id}`, 'user', 'devices'])
   assert.equal(store.getState().phase, 'authenticated')
 })
 
@@ -167,7 +167,7 @@ test('registration failure skips login; successful registration with failed logi
 
 test('revoked identity recovery waits for persisted replacement and retries only once', async () => {
   for (const retryFails of [false, true]) {
-    const { store, session, identities, calls } = setup(false)
+    const { store, session, identities, account, calls } = setup(false)
     await store.getState().restore()
     const savedReplacement = deferred<DeviceIdentity>()
     identities.replace = () => savedReplacement.promise
@@ -176,6 +176,7 @@ test('revoked identity recovery waits for persisted replacement and retries only
       calls.push(`login:${device.id}`)
       if (++attempts === 1 || retryFails) throw new ClientError('Revoked', 'device_revoked')
     }
+    account.getCurrentUser = async () => { calls.push('user'); return { ...user, deviceId: replacement.id } }
     const login = store.getState().login('alice', ' test-password ')
     await Promise.resolve()
     assert.equal(attempts, 1)
@@ -406,4 +407,39 @@ test('disposal during account loading ignores its eventual success or failure', 
     await restoring
     assert.equal(store.getState(), disposed)
   }
+})
+
+test('restoration rejects an old mailbox cookie after durable device rotation', async () => {
+  const { session, account, identities, calls } = setup()
+  identities.get = async () => replacement
+  let prepared = false
+  const store = createSessionStore({ session, account, identities, prepareInbox: async () => { prepared = true } })
+  await store.getState().restore()
+  assert.equal(store.getState().phase, 'anonymous')
+  assert.match(store.getState().authError!, /storage changed/)
+  assert.equal(calls.includes('logout'), true)
+  assert.equal(prepared, false)
+})
+
+test('authentication waits for durable inbox activation and fails closed on storage failure', async () => {
+  const { session, account, identities } = setup()
+  const activation = deferred<void>()
+  const store = createSessionStore({ session, account, identities, prepareInbox: () => activation.promise })
+  const restoring = store.getState().restore()
+  await new Promise(done => setImmediate(done))
+  assert.equal(store.getState().phase, 'restoring')
+  activation.reject(new Error('Local store lost'))
+  await restoring
+  assert.equal(store.getState().phase, 'anonymous')
+  assert.equal(store.getState().authError, 'Local store lost')
+})
+
+test('login rereads durable identity after local database loss while signed out', async () => {
+  const { store, identities, account, calls } = setup(false)
+  await store.getState().restore()
+  identities.get = async () => replacement
+  account.getCurrentUser = async () => ({ ...user, deviceId: replacement.id })
+  await store.getState().login('alice', ' test-password ')
+  assert.ok(calls.includes(`login:${replacement.id}`))
+  assert.equal(store.getState().phase, 'authenticated')
 })

@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  ChatPreferencesService, DeviceIdentityService, isDeviceIdentity,
+  ChatPreferencesService, ClientError, DeviceIdentityService, isDeviceIdentity,
   type ChatPreferencesStore, type DeviceIdentity, type DeviceIdentityStore, type DirectChat,
 } from '../src/index.ts'
 
 const identity: DeviceIdentity = { id: '00000000-0000-4000-8000-000000000001', name: 'Saved device' }
 const replacement: DeviceIdentity = { id: '00000000-0000-4000-8000-000000000002', name: 'New device' }
+
+test('concurrent durable initialization adopts the committed winner only for a generation conflict', async () => {
+  let reads = 0
+  const service = new DeviceIdentityService({
+    async read() { return ++reads === 1 ? null : identity },
+    async write() { throw new ClientError('Generation changed', 'local_generation_changed') },
+  }, () => replacement.id, async () => replacement.name)
+  assert.deepEqual(await service.get(), identity)
+})
 
 function identitySetup(initial: unknown) {
   let stored = initial

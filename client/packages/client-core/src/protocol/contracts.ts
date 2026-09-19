@@ -85,8 +85,10 @@ export type ServerEvent =
   | { type: 'auth.ok' }
   | { type: 'message.new'; data: MailboxEnvelope }
   | { type: 'message.accepted'; request_id: string; data: SentMessageDto }
+  | { type: 'sync.response'; request_id: string; data: MailboxPageDto }
   | { type: 'error'; request_id?: string; error: { code: string; message: string; status: number } }
 
 export type ClientEvent =
   | { type: 'auth'; access_token: string }
   | { type: 'message.send'; request_id: string; data: SendMessageRequest }
+  | { type: 'sync.request'; request_id: string; data: { after_seq: number; limit: number } }

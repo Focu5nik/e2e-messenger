@@ -1,7 +1,8 @@
 # Secure Messenger
 
-V4 monorepo with a FastAPI backend, React frontend, PostgreSQL, JWT authentication,
-account-scoped device identity, one-to-one chats, and WebSocket message delivery.
+V5 monorepo with a FastAPI backend, React frontend, PostgreSQL, JWT authentication,
+account-scoped device identity, one-to-one chats, WebSocket message delivery, and
+an IndexedDB-backed durable local inbox with offline mailbox synchronization.
 
 ## Local setup
 
@@ -112,6 +113,8 @@ After `{"type":"auth.ok"}`, use these JSON events:
 | Client → server | `message.send` | `request_id`, `data`: the same command as `POST /messages` |
 | Server → sender | `message.accepted` | `request_id`, `data`: the HTTP message response |
 | Server → recipient device | `message.new` | `data`: one mailbox envelope with message metadata |
+| Client → server | `sync.request` | `request_id`, `data`: `{after_seq, limit}` (defaults: `0`, `100`; limit: `1..100`) |
+| Server → client | `sync.response` | `request_id`, `data`: `{envelopes, next_seq, has_more}` matching the HTTP mailbox response |
 | Server → client | `error` | Optional `request_id`, `error`: `{code, message, status}` |
 
 The send command contains `chat_id`, `client_message_id`, and the client-built
@@ -126,14 +129,26 @@ event routing. Connections are device-scoped; a newer connection replaces the ol
 one with close code `4001`. Authentication failures use `4401`, and disallowed
 origins are rejected with `4403` before the connection is accepted.
 
-V4 uses an in-memory event bus and supports a single backend process. Socket delivery
+V5 uses an in-memory event bus and supports a single backend process. Socket delivery
 is a best-effort attempt: it neither marks an envelope delivered nor purges its
-payload. The stable protocol reserves `message.delivered` and
-`sync.request` / `sync.response`; requests for these deferred capabilities receive
-an `unsupported_event` error in V4. Received content remains in memory, with the
-existing HTTP mailbox available after reload. Durable local storage, offline sync,
-and delivery acknowledgements belong to later versions. Unacknowledged payloads
-retain the existing 45-day expiry and metadata-only tombstones.
+payload. `sync.request` pages the authenticated device's PostgreSQL mailbox,
+including metadata-only tombstones. `message.delivered` remains reserved and returns
+`unsupported_event`; delivery acknowledgements and ACK-triggered purge begin in V6.
+Retrieved payloads retain the existing 45-day expiry.
+
+The shared `SyncManager` coordinates realtime ingestion and mailbox paging through
+the browser's `DurableInbox` adapter. Each ordered page and its cursor commit in one
+IndexedDB transaction; gaps and failed transactions cannot advance the cursor.
+Reload reconstructs messages from stored opaque envelopes and outgoing commands.
+Outgoing commands retain their original client message ID and envelope bytes; an
+ambiguous WebSocket send is never automatically replayed over HTTP.
+
+IndexedDB owns the device identity and local-store generation. Upgrading from V4
+rotates the old localStorage identity and requires signing in to register the new
+device. Clearing or losing IndexedDB likewise requires a fresh device; a surviving
+cookie for the old mailbox cannot start messaging. Local backup/restore is out of
+scope. Protocol 0 remains the existing development format, so V5 adds durability,
+not E2EE.
 
 ## Repository layout
 

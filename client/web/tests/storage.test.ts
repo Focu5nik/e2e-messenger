@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { afterEach, beforeEach, test } from 'node:test'
 import { JSDOM } from 'jsdom'
 import { browserDeviceDescription } from '../src/shared/platform/deviceDescription.ts'
-import { browserChatPreferencesStore, browserDeviceIdentityStore } from '../src/shared/platform/storage.ts'
+import { browserChatPreferencesStore } from '../src/shared/platform/storage.ts'
 
 let dom: JSDOM
 const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
@@ -19,18 +19,6 @@ afterEach(() => {
   else Reflect.deleteProperty(globalThis, 'localStorage')
   if (originalNavigator) Object.defineProperty(globalThis, 'navigator', originalNavigator)
   else Reflect.deleteProperty(globalThis, 'navigator')
-})
-
-test('browser identity storage preserves the existing key and JSON format and tolerates malformed JSON', async () => {
-  assert.equal(await browserDeviceIdentityStore.read(), null)
-  localStorage.setItem('messenger.device', '{broken')
-  assert.equal(await browserDeviceIdentityStore.read(), null)
-  localStorage.setItem('messenger.device', '{"id":123}')
-  assert.deepEqual(await browserDeviceIdentityStore.read(), { id: 123 })
-  const identity = { id: '00000000-0000-4000-8000-000000000001', name: 'Saved browser' }
-  await browserDeviceIdentityStore.write(identity)
-  assert.equal(localStorage.getItem('messenger.device'), JSON.stringify(identity))
-  assert.deepEqual(await browserDeviceIdentityStore.read(), identity)
 })
 
 test('browser preferences preserve per-user keys and remove only the requested preference', async () => {
@@ -66,8 +54,6 @@ test('storage access failures reject instead of being treated as missing data', 
     configurable: true,
     get() { throw new Error('Storage unavailable') },
   })
-  await assert.rejects(browserDeviceIdentityStore.read(), /Storage unavailable/)
-  await assert.rejects(browserDeviceIdentityStore.write({ id: 'id', name: 'name' }), /Storage unavailable/)
   await assert.rejects(browserChatPreferencesStore.getLastChatId('alice'), /Storage unavailable/)
   await assert.rejects(browserChatPreferencesStore.setLastChatId('alice', null), /Storage unavailable/)
 })

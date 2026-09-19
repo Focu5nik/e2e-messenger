@@ -21,7 +21,7 @@ function message(id = 'message-1', chatId = chats[0].id): ReceivedMessage {
 }
 
 function mailbox(messages: ReceivedMessage[] = []): MailboxLoadResult {
-  return { messages, nextSeq: messages.length, tombstoneCount: 0 }
+  return { messages, envelopes: [], nextSeq: messages.length, tombstoneCount: 0 }
 }
 
 function accepted(chatId: string): SentMessage {
@@ -81,6 +81,29 @@ function setup() {
   const ready = () => { for (const handler of readyListeners) handler() }
   return { store, gateway, messenger, storage, preferences, calls, saved, writes, listeners, readyListeners, sent, receive, ready }
 }
+
+test('cached messages and chat selection restore even when remote catch-up fails', async () => {
+  const { store, messenger, gateway, saved } = setup()
+  saved.set('alice', chats[0].id)
+  messenger.restoreLocal = async () => ({ ...mailbox([message()]), chats })
+  messenger.loadMailbox = async () => { throw new Error('Offline mailbox') }
+  gateway.getChats = async () => { throw new Error('Offline chats') }
+  await store.getState().start('alice')
+  assert.equal(store.getState().messages.length, 1)
+  assert.equal(store.getState().selectedChat?.id, chats[0].id)
+  assert.equal(store.getState().mailboxError, 'Offline mailbox')
+  store.getState().dispose()
+})
+
+test('an empty local chat cache preserves the preference until the server list is loaded', async () => {
+  const { store, messenger, saved } = setup()
+  saved.set('alice', chats[0].id)
+  messenger.restoreLocal = async () => ({ ...mailbox(), chats: [] })
+  await store.getState().start('alice')
+  assert.equal(store.getState().selectedChat?.id, chats[0].id)
+  assert.equal(saved.get('alice'), chats[0].id)
+  store.getState().dispose()
+})
 
 test('startup loads chats and mailbox and restores only the current user preference with fresh details', async () => {
   const { store, gateway, saved, calls } = setup()

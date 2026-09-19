@@ -40,6 +40,7 @@ export interface RealtimeGateway {
   start(): void
   stop(): void
   sendMessage(command: SendMessageRequest): Promise<SentMessage>
+  getMailbox?(afterSeq: number, limit?: number): Promise<MailboxPage>
   onMessage(handler: (envelope: MailboxEnvelope) => void): () => void
   onReady(handler: () => void): () => void
 }
