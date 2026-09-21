@@ -1,8 +1,9 @@
 # Secure Messenger
 
-V5 monorepo with a FastAPI backend, React frontend, PostgreSQL, JWT authentication,
+V6 monorepo with a FastAPI backend, React frontend, PostgreSQL, JWT authentication,
 account-scoped device identity, one-to-one chats, WebSocket message delivery, and
-an IndexedDB-backed durable local inbox with offline mailbox synchronization.
+an IndexedDB-backed durable local inbox, offline mailbox synchronization, and
+durable delivery acknowledgements with per-device server payload purge.
 
 ## Local setup
 
@@ -72,6 +73,8 @@ revoke a device, exchange messages in real time, and sign out.
 - `GET /chats/{chat_id}`
 - `GET /chats/{chat_id}/destination-devices`
 - `POST /messages`
+- `GET /messages/by-client-id/{client_message_id}`
+- `POST /messages/envelopes/{envelope_id}/ack`
 - `GET /messages/mailbox?after_seq=0&limit=100`
 
 Access tokens are short-lived JWTs returned in response bodies. Refresh tokens are
@@ -115,6 +118,9 @@ After `{"type":"auth.ok"}`, use these JSON events:
 | Server → recipient device | `message.new` | `data`: one mailbox envelope with message metadata |
 | Client → server | `sync.request` | `request_id`, `data`: `{after_seq, limit}` (defaults: `0`, `100`; limit: `1..100`) |
 | Server → client | `sync.response` | `request_id`, `data`: `{envelopes, next_seq, has_more}` matching the HTTP mailbox response |
+| Client → server | `message.delivered` | `request_id`, `data`: `{envelope_id}` after durable local receipt |
+| Server → acknowledging device | `message.delivered` | `request_id`, `data`: the envelope metadata with delivery/purge timestamps and null payload |
+| Server → sending device | `message.delivered` | No `request_id`; `data`: the same per-envelope delivery receipt |
 | Server → client | `error` | Optional `request_id`, `error`: `{code, message, status}` |
 
 The send command contains `chat_id`, `client_message_id`, and the client-built
@@ -129,12 +135,13 @@ event routing. Connections are device-scoped; a newer connection replaces the ol
 one with close code `4001`. Authentication failures use `4401`, and disallowed
 origins are rejected with `4403` before the connection is accepted.
 
-V5 uses an in-memory event bus and supports a single backend process. Socket delivery
-is a best-effort attempt: it neither marks an envelope delivered nor purges its
-payload. `sync.request` pages the authenticated device's PostgreSQL mailbox,
-including metadata-only tombstones. `message.delivered` remains reserved and returns
-`unsupported_event`; delivery acknowledgements and ACK-triggered purge begin in V6.
-Retrieved payloads retain the existing 45-day expiry.
+V6 uses an in-memory event bus and supports a single backend process. Socket delivery
+alone remains a best-effort attempt. After the recipient commits an envelope and
+cursor to IndexedDB, its explicit ACK atomically sets `delivered_at`, clears only
+that device's payload, and sets `payload_purged_at`. ACK retries preserve the first
+timestamps. Other devices retain their payload until their own ACK or the existing
+45-day expiry. Envelope/message rows, receipts, routing, cursors, and idempotency
+metadata remain available. `sync.request` includes metadata-only tombstones.
 
 The shared `SyncManager` coordinates realtime ingestion and mailbox paging through
 the browser's `DurableInbox` adapter. Each ordered page and its cursor commit in one
@@ -142,13 +149,22 @@ IndexedDB transaction; gaps and failed transactions cannot advance the cursor.
 Reload reconstructs messages from stored opaque envelopes and outgoing commands.
 Outgoing commands retain their original client message ID and envelope bytes; an
 ambiguous WebSocket send is never automatically replayed over HTTP.
+Recovery first looks up the original client message ID for the authenticated sender
+device. Only a confirmed missing result permits resending the exact durable command.
+Outgoing messages display pending and accepted states; a single-destination message
+becomes delivered on its device receipt. Multi-device receipts are retained separately;
+their aggregate UI semantics belong to V7. Pending commands can be retried from the UI.
+
+Locally committed envelopes without a confirmed receipt are ACKed again after sync
+or reload. A server purge never deletes the recipient's local payload. No database
+migration is required for V6; the existing envelope columns hold delivery metadata.
 
 IndexedDB owns the device identity and local-store generation. Upgrading from V4
 rotates the old localStorage identity and requires signing in to register the new
 device. Clearing or losing IndexedDB likewise requires a fresh device; a surviving
 cookie for the old mailbox cannot start messaging. Local backup/restore is out of
-scope. Protocol 0 remains the existing development format, so V5 adds durability,
-not E2EE.
+scope. Protocol 0 remains the existing development format; V6 adds delivery
+reliability without changing cryptography.
 
 ## Repository layout
 
@@ -189,6 +205,7 @@ implemented.
 ```powershell
 npm test
 npm run lint --workspace client/web
+node client/scripts/verify-v6-browser.mjs
 ```
 
 To check only the JavaScript/TypeScript workspaces:
@@ -202,3 +219,6 @@ npm run test:frontend
 To include PostgreSQL locking and concurrency tests, migrate an isolated test
 database, then set `TEST_DATABASE_URL` before running `npm test`. These tests are
 skipped when that variable is unset.
+
+The V6 browser check uses an installed Chromium browser with a temporary, isolated
+profile and real IndexedDB. Set `CHROMIUM_PATH` if Chrome/Edge is installed elsewhere.

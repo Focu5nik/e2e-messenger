@@ -279,7 +279,7 @@ test('real-time incoming envelopes use the same decoder, skip tombstones and sto
   const messenger = new MessengerService(api, codec, createId, realtime)
   const messages: unknown[] = []
   const errors: unknown[] = []
-  const unsubscribe = messenger.subscribe((message) => messages.push(message), (error) => errors.push(error))
+  const unsubscribe = messenger.subscribe((message) => messages.push(...message), (error) => errors.push(error))
   receive?.(mailboxEnvelope())
   receive?.(mailboxEnvelope({ payload: null }))
   const mailbox = await messenger.loadMailbox()
@@ -311,7 +311,7 @@ test('a late initial mailbox snapshot preserves live arrivals and accepted sends
     messageId: 'outgoing', chatId: 'chat-1', senderUserId: 'me', content: 'sent', createdAt: '2026-09-07T10:02:00Z',
   }]
   const unsubscribe = messenger.subscribe(
-    (message) => { displayed = mergeMessages(displayed, [message]) },
+    (message) => { displayed = mergeMessages(displayed, message) },
     (error) => { throw error },
   )
   const initialLoad = messenger.loadMailbox().then(({ messages }) => { displayed = mergeMessages(displayed, messages) })
@@ -438,4 +438,29 @@ test('mergeMessages deduplicates by message ID, replaces overlaps, and sorts wit
   assert.deepEqual(mergeMessages(current, incoming), [updated, middle, last])
   assert.deepEqual(current, [last, first])
   assert.deepEqual(incoming, [middle, updated, middle])
+})
+
+
+test('V6 optimistic pending IDs converge to one accepted message and late snapshots cannot regress delivery', () => {
+  const pending = { messageId: 'pending:client', clientMessageId: 'client', senderDeviceId: 'device',
+    chatId: 'chat', senderUserId: 'user', content: 'private', createdAt: '2026-09-19T00:00:00Z', status: 'pending' as const }
+  const accepted = { ...pending, messageId: 'server-message', status: 'accepted' as const }
+  const delivered = { ...accepted, status: 'delivered' as const }
+  assert.deepEqual(mergeMessages([pending], [accepted]), [accepted])
+  assert.deepEqual(mergeMessages([delivered], [pending]), [delivered])
+  assert.deepEqual(mergeMessages([delivered], [accepted]), [delivered])
+})
+
+test('merge preserves references for repeated snapshots and keeps command identities scoped to chat and device', () => {
+  const pending: DisplayMessage = { messageId: 'pending', chatId: 'chat', senderUserId: 'user', senderDeviceId: 'device',
+    clientMessageId: 'client', content: 'private', createdAt: '2026-09-19T00:00:00Z', status: 'pending' }
+  const accepted = { ...pending, messageId: 'accepted', status: 'accepted' as const,
+    deliveries: [{ deviceId: 'recipient', deliveredAt: null }] }
+  const current = [accepted]
+  assert.equal(mergeMessages(current, structuredClone(current)), current)
+  assert.equal(mergeMessages(current, [pending]), current)
+  assert.equal(mergeMessages(current, []), current)
+  const otherChat = { ...pending, messageId: 'other-chat', chatId: 'other' }
+  const otherDevice = { ...pending, messageId: 'other-device', senderDeviceId: 'other' }
+  assert.deepEqual(mergeMessages([pending, otherChat, otherDevice], [accepted]), [accepted, otherDevice, otherChat])
 })

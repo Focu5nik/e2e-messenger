@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>V6 IndexedDB verification</title>
+<pre id="result" data-status="running">Running V6 IndexedDB checks…</pre>
+<script>
+function reportError(message) {
+  void fetch('/__verification', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'failed', text: message }),
+  })
+}
+window.addEventListener('error', (event) => reportError(event.message))
+window.addEventListener('unhandledrejection', (event) => reportError(String(event.reason)))
+</script>
+<script type="module">
+import { IndexedDBDurableInbox } from '/src/shared/platform/durableInbox.ts'
+import { SyncManager } from '@secure-messenger/client-core'
+
+const output = document.querySelector('#result')
+const results = []
+function assert(condition, message) { if (!condition) throw new Error(message) }
+async function rejects(operation, message) {
+  try { await operation() } catch { return }
+  throw new Error(message)
+}
+const timestamp = '2026-09-19T00:00:00Z'
+const deviceId = '00000000-0000-4000-8000-000000000001'
+const envelope = {
+  id: 'envelope-1', message_id: 'message-1', chat_id: 'chat',
+  sender_user_id: 'alice', sender_device_id: 'alice-device', client_message_id: 'client-1',
+  recipient_device_id: deviceId, mailbox_seq: 1, protocol_version: 0,
+  envelope_type: 'PLAINTEXT', payload: 'b3BhcXVl', created_at: timestamp,
+  message_created_at: timestamp, expires_at: '2026-11-03T00:00:00Z',
+  delivered_at: null, payload_purged_at: null,
+}
+
+try {
+  const databaseName = `messenger-v6-test-${crypto.randomUUID()}`
+  const inbox = new IndexedDBDurableInbox({ databaseName })
+  await inbox.read()
+  await inbox.write({ id: deviceId, name: 'Isolated test device' })
+  const identity = await inbox.read()
+  const scope = { userId: 'bob', deviceId: identity.id, generation: identity.generation }
+
+  // Fail after the first write has succeeded inside the transaction. Neither
+  // the first envelope nor the cursor may survive the transaction abort.
+  await rejects(() => inbox.commitPage(scope, 0, [
+    envelope, { ...envelope, id: 'invalid', mailbox_seq: 2, recipient_device_id: 'other' },
+  ], 2), 'An invalid page must abort')
+  let snapshot = await inbox.snapshot(scope)
+  assert(snapshot.cursor === 0 && snapshot.envelopes.length === 0, 'Partial page survived rollback')
+  results.push('PASS: failed IndexedDB transaction preserves the cursor and rolls back every envelope')
+
+  await inbox.commitPage(scope, 0, [envelope], 1)
+  const restored = new IndexedDBDurableInbox({ databaseName })
+  snapshot = await restored.snapshot(scope)
+  assert(snapshot.cursor === 1 && snapshot.envelopes[0].payload === envelope.payload, 'Reload lost committed payload')
+  await restored.commitPage(scope, 1, [envelope], 1)
+  assert((await restored.snapshot(scope)).envelopes.length === 1, 'Redelivery duplicated the envelope')
+  results.push('PASS: reload restores durable state and redelivery is duplicate-safe')
+
+  await restored.commitPage(scope, 1, [{
+    ...envelope, payload: null, delivered_at: timestamp, payload_purged_at: timestamp,
+  }], 1)
+  snapshot = await restored.snapshot(scope)
+  assert(snapshot.envelopes[0].payload === envelope.payload, 'Server purge deleted local content')
+  assert(snapshot.envelopes[0].delivered_at === timestamp, 'Delivery metadata was lost')
+  results.push('PASS: ACK tombstone preserves the local payload and updates delivery metadata')
+
+  const command = { chat_id: 'chat', client_message_id: 'outgoing-1', envelopes: [{
+    recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'PLAINTEXT', payload: 'ZXhhY3Q=',
+  }] }
+  const pending = await inbox.putOutgoing(scope, command)
+  const repeated = await restored.putOutgoing(scope, structuredClone(command))
+  assert(JSON.stringify(pending) === JSON.stringify(repeated), 'An immutable retry must return the committed row')
+  assert(JSON.stringify(await restored.getOutgoing(scope, command.client_message_id)) === JSON.stringify(pending),
+    'A direct outgoing lookup must return the committed row')
+  assert(await restored.getOutgoing(scope, 'missing') === null, 'Missing outgoing lookup must return null')
+  assert(await restored.getOutgoing({ ...scope, userId: 'other-user' }, command.client_message_id) === null,
+    'Outgoing lookup leaked another user scope')
+  await rejects(() => restored.getOutgoing({ ...scope, generation: 'stale' }, command.client_message_id),
+    'Outgoing lookup must reject a stale generation')
+  await rejects(() => restored.putOutgoing(scope, { ...command, envelopes: [{
+    ...command.envelopes[0], payload: 'Y2hhbmdlZA==',
+  }] }), 'Changed retry bytes must be rejected')
+  snapshot = await restored.snapshot(scope)
+  assert(snapshot.outgoing.length === 1, 'Duplicate durable outgoing command')
+  assert(JSON.stringify(snapshot.outgoing[0].command) === JSON.stringify(command), 'Retry bytes changed')
+  results.push('PASS: outgoing commands retain their exact original ID and bytes across reload')
+
+  const replacement = { ...command, envelopes: [{ ...command.envelopes[0], recipient_device_id: 'new-device' }] }
+  const pendingCreatedAt = snapshot.outgoing[0].createdAt
+  await restored.putOutgoing(scope, replacement, true)
+  snapshot = await restored.snapshot(scope)
+  assert(snapshot.outgoing.length === 1 && snapshot.outgoing[0].createdAt === pendingCreatedAt,
+    'Explicit rejection replacement lost or duplicated the durable pending record')
+  const accepted = {
+    id: 'sent-1', chatId: 'chat', clientMessageId: command.client_message_id,
+    senderUserId: scope.userId, senderDeviceId: scope.deviceId, createdAt: timestamp,
+    envelopes: [{ ...envelope, message_id: 'sent-1', recipient_device_id: 'new-device',
+      payload: null, delivered_at: timestamp, payload_purged_at: timestamp }],
+  }
+  await restored.acceptOutgoing(scope, accepted)
+  const committed = await restored.acceptOutgoing(scope, { ...accepted, envelopes: [{
+    ...accepted.envelopes[0], delivered_at: null, payload_purged_at: null,
+  }] })
+  assert((await restored.snapshot(scope)).outgoing[0].accepted.envelopes[0].delivered_at === timestamp,
+    'A stale acceptance response regressed a durable delivery receipt')
+  assert(committed.accepted.envelopes[0].delivered_at === timestamp,
+    'Acceptance must return the merged committed receipt, not the stale response')
+  results.push('PASS: direct outgoing reads are scoped and writes return committed rows with preserved receipts')
+  await rejects(() => restored.putOutgoing(scope, command, true), 'Accepted commands must never be replaced')
+  results.push('PASS: explicit rejection replacement is atomic and late acceptance cannot regress delivery')
+
+  const recoveryName = `messenger-v6-recovery-${crypto.randomUUID()}`
+  const receiving = new IndexedDBDurableInbox({ databaseName: recoveryName })
+  await receiving.read()
+  await receiving.write({ id: deviceId, name: 'Recovery test device' })
+  const durableIdentity = await receiving.read()
+  const receivingScope = { userId: 'bob', deviceId, generation: durableIdentity.generation }
+  const observer = new IndexedDBDurableInbox({ databaseName: recoveryName })
+  let ackAttempts = 0
+  let purged = false
+  const api = {
+    async getMailbox(after) {
+      return { envelopes: after ? [] : [envelope], nextSeq: 1, hasMore: false }
+    },
+    async acknowledgeEnvelope(id) {
+      const committed = await observer.snapshot(receivingScope)
+      assert(committed.cursor === 1 && committed.envelopes[0]?.id === id,
+        'ACK was emitted before the IndexedDB transaction committed')
+      ackAttempts += 1
+      if (ackAttempts === 1) throw new Error('Connection lost before ACK reached server')
+      purged = true
+      if (ackAttempts === 2) throw new Error('ACK committed but response was lost')
+      return { ...envelope, payload: null, delivered_at: timestamp, payload_purged_at: timestamp }
+    },
+  }
+  const user = { id: 'bob', deviceId, username: 'bob', sessionId: 'session', status: 'active', createdAt: timestamp }
+  const sync = new SyncManager(receiving, api)
+  await sync.activate(user)
+  const commit = receiving.commitPage.bind(receiving)
+  receiving.commitPage = (scope, cursor) => commit(scope, cursor, [
+    envelope, { ...envelope, id: 'bad', mailbox_seq: 2, recipient_device_id: 'other' },
+  ], 2)
+  await rejects(() => sync.ingest(envelope), 'Failed local transaction must reject ingestion')
+  assert(ackAttempts === 0 && (await observer.snapshot(receivingScope)).cursor === 0,
+    'Local rollback emitted an ACK or advanced the cursor')
+  receiving.commitPage = commit
+  await sync.ingest(envelope)
+  assert(ackAttempts === 1 && !purged, 'Pre-ACK failure was not simulated')
+  assert((await observer.snapshot(receivingScope)).envelopes[0].payload === envelope.payload,
+    'ACK failure lost committed content')
+  sync.deactivate()
+  const resumed = new SyncManager(observer, api)
+  await resumed.activate(user)
+  await resumed.synchronize()
+  await resumed.synchronize()
+  snapshot = await observer.snapshot(receivingScope)
+  assert(purged && ackAttempts === 3, 'Reload did not retry both ambiguous ACK outcomes')
+  assert(snapshot.envelopes.length === 1 && snapshot.envelopes[0].delivered_at === timestamp,
+    'ACK retry failed to converge on one durable receipt')
+  assert(snapshot.envelopes[0].payload === envelope.payload, 'ACK purge lost local content')
+  results.push('PASS: real IndexedDB commit precedes ACK; reload recovers failures before and after server ACK')
+
+  // Seed the old schema to exercise an actual version-1 upgrade/backfill.
+  const migrationName = `messenger-index-upgrade-${crypto.randomUUID()}`
+  const legacy = await new Promise((resolve, reject) => {
+    const opening = indexedDB.open(migrationName, 1)
+    opening.onupgradeneeded = () => {
+      for (const name of ['identity', 'envelopes', 'outgoing', 'chats', 'cursors']) {
+        const store = opening.result.createObjectStore(name, { keyPath: 'key' })
+        if (name !== 'identity') store.createIndex('scope', 'scope')
+      }
+    }
+    opening.onsuccess = () => resolve(opening.result)
+    opening.onerror = () => reject(opening.error)
+  })
+  const scopeId = JSON.stringify([scope.userId, scope.deviceId, scope.generation])
+  const stored = (id, value) => ({ key: JSON.stringify([scopeId, id]), scope: scopeId, value })
+  await new Promise((resolve, reject) => {
+    const tx = legacy.transaction(['identity', 'envelopes', 'outgoing', 'cursors'], 'readwrite')
+    tx.oncomplete = resolve
+    tx.onabort = () => reject(tx.error)
+    tx.objectStore('identity').put({ key: 'current', value: identity })
+    tx.objectStore('cursors').put({ key: scopeId, scope: scopeId, value: 30 })
+    for (let index = 0; index < 30; index += 1) {
+      tx.objectStore('envelopes').put(stored(`in-${index}`, {
+        ...envelope, id: `in-${index}`, mailbox_seq: index + 1,
+        chat_id: index < 20 ? 'chat' : 'other', delivered_at: index === 0 ? null : timestamp,
+      }))
+      tx.objectStore('outgoing').put(stored(`out-${index}`, {
+        command: { ...command, client_message_id: `out-${index}` }, createdAt: timestamp,
+        accepted: index === 0 ? null : { ...accepted, id: `sent-${index}`, clientMessageId: `out-${index}`,
+          envelopes: [{ ...accepted.envelopes[0], id: `receipt-${index}`, message_id: `sent-${index}`, delivered_at: index === 1 ? null : timestamp }] },
+      }))
+    }
+  })
+  legacy.close()
+  const upgraded = new IndexedDBDurableInbox({ databaseName: migrationName })
+  // Ordinary reads must not scan a scope or an object store.
+  const indexGetAll = IDBIndex.prototype.getAll
+  const storeGetAll = IDBObjectStore.prototype.getAll
+  IDBIndex.prototype.getAll = function (...args) {
+    assert(this.name !== 'scope', 'Ordinary operation scanned the scope index')
+    return indexGetAll.apply(this, args)
+  }
+  IDBObjectStore.prototype.getAll = function () { throw new Error('Ordinary operation scanned an object store') }
+  try {
+    assert(await upgraded.readCursor(scope) === 30, 'Upgrade lost the cursor')
+    assert((await upgraded.getPendingAcknowledgments(scope)).length === 1, 'ACK index backfill is incorrect')
+    assert((await upgraded.getOutgoingToRecover(scope)).length === 2, 'Recovery index included delivered history')
+    const ids = []
+    let before
+    do {
+      const page = await upgraded.readChatHistory(scope, 'chat', 7, before)
+      assert(page.envelopes.length + page.outgoing.length <= 7, 'History page exceeded its limit')
+      assert(page.envelopes.every(item => item.chat_id === 'chat'), 'History leaked another chat')
+      ids.push(...page.envelopes.map(item => `in:${item.id}`), ...page.outgoing.map(item => `out:${item.command.client_message_id}`))
+      before = page.nextBefore
+    } while (before)
+    assert(ids.length === 50 && new Set(ids).size === 50, 'History pagination lost or repeated timestamp ties')
+    assert((await upgraded.readChatHistory({ ...scope, userId: 'other-user' }, 'chat', 7)).envelopes.length === 0,
+      'History leaked another user scope')
+    await rejects(() => upgraded.readChatHistory({ ...scope, generation: 'stale' }, 'chat', 7), 'History accepted a stale generation')
+    // Acceptance must not move an unread pending row across a page boundary.
+    const pagingCommands = []
+    for (let index = 0; index < 5; index++) {
+      const item = { ...command, chat_id: 'paging', client_message_id: `paging-${index}` }
+      pagingCommands.push(item)
+      await upgraded.putOutgoing(scope, item)
+    }
+    const firstPage = await upgraded.readChatHistory(scope, 'paging', 2)
+    const seen = firstPage.outgoing.map(item => item.command.client_message_id)
+    const unread = pagingCommands.find(item => !seen.includes(item.client_message_id))
+    await upgraded.acceptOutgoing(scope, { ...accepted, chatId: 'paging', id: 'paging-accepted',
+      clientMessageId: unread.client_message_id, createdAt: '2099-01-01T00:00:00Z', envelopes: [] })
+    let pagingCursor = firstPage.nextBefore
+    while (pagingCursor) {
+      const page = await upgraded.readChatHistory(scope, 'paging', 2, pagingCursor)
+      seen.push(...page.outgoing.map(item => item.command.client_message_id))
+      pagingCursor = page.nextBefore
+    }
+    assert(seen.length === 5 && new Set(seen).size === 5, 'Acceptance moved a row across the history cursor')
+    for (const item of pagingCommands) {
+      await upgraded.acceptOutgoing(scope, { ...accepted, chatId: 'paging', id: `done-${item.client_message_id}`,
+        clientMessageId: item.client_message_id, envelopes: [{ ...accepted.envelopes[0], delivered_at: timestamp }] })
+    }
+    const receipt = { ...accepted.envelopes[0], id: 'receipt-1', message_id: 'sent-1' }
+    const delivered = await upgraded.applyDeliveryReceipt(scope, receipt)
+    assert(delivered?.accepted.envelopes[0].delivered_at === timestamp, 'Targeted receipt did not update acceptance')
+    assert(await upgraded.applyDeliveryReceipt(scope, receipt) === null, 'Duplicate receipt was reported as changed')
+    assert((await upgraded.getOutgoingToRecover(scope)).length === 1, 'Delivered row remained in recovery index')
+    const early = { ...receipt, id: 'early', message_id: 'sent-0' }
+    await upgraded.applyDeliveryReceipt(scope, early)
+    const reloaded = new IndexedDBDurableInbox({ databaseName: migrationName })
+    const merged = await reloaded.acceptOutgoing(scope, { ...accepted, id: 'sent-0', clientMessageId: 'out-0',
+      envelopes: [{ ...early, delivered_at: null, payload_purged_at: null }] })
+    assert(merged.accepted.envelopes[0].delivered_at === timestamp, 'Early receipt did not survive reload and acceptance')
+    assert((await reloaded.getOutgoingToRecover(scope)).length === 0, 'Early receipt failed to remove recovery work')
+    const delta = await upgraded.commitPage(scope, 30, [{ ...envelope, id: 'in-0', delivered_at: timestamp }], 30)
+    assert(delta.length === 1 && (await upgraded.getPendingAcknowledgments(scope)).length === 0, 'ACK index did not update atomically')
+    assert((await upgraded.commitPage(scope, 30, delta, 30)).length === 0, 'Duplicate envelope returned a delta')
+  } finally {
+    IDBIndex.prototype.getAll = indexGetAll
+    IDBObjectStore.prototype.getAll = storeGetAll
+  }
+  results.push('PASS: v1 migration backfills indexed work queues and bounded chat history; early receipts survive reload')
+
+  output.dataset.status = 'passed'
+  output.textContent = results.join('\n')
+} catch (error) {
+  output.dataset.status = 'failed'
+  output.textContent = `${results.join('\n')}\nFAIL: ${error.stack ?? error}`
+}
+await fetch('/__verification', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ status: output.dataset.status, text: output.textContent }),
+})
+</script>
+</html>

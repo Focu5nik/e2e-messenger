@@ -1,16 +1,27 @@
 import { createStore } from 'zustand/vanilla'
 import type { DirectChat, DisplayMessage, User } from '../domain/models.ts'
+import type { ChatHistoryCursor } from '../ports/durableInbox.ts'
 import type { ChatGateway } from '../ports/gateways.ts'
 import type { MessengerService } from '../messaging/messengerService.ts'
-import { mergeMessages } from '../messaging/messageState.ts'
+import { mergeMessagesByChat, type MessagesByChat } from '../messaging/messageState.ts'
 import type { ChatPreferencesService } from './chatPreferences.ts'
 
 export type ChatStoreDependencies = {
   chats: ChatGateway
   messenger: Pick<MessengerService, 'loadMailbox' | 'subscribe' | 'onReady' | 'sendText'>
-    & Partial<Pick<MessengerService, 'restoreLocal' | 'cacheChats'>>
+    & Partial<Pick<MessengerService, 'onChatActivity' | 'restoreMetadata' | 'loadChatHistory' | 'setHistoryChats' | 'restoreLocal' | 'cacheChats' | 'onOutgoing' | 'onDelivery' | 'retryOutgoing'>>
   preferences: Pick<ChatPreferencesService, 'restore' | 'select'>
 }
+
+export type ChatHistoryState = {
+  loading: boolean
+  error: string | null
+  loaded: boolean
+  hasPrevious: boolean
+  cursor: ChatHistoryCursor | null
+}
+const emptyHistory = (): ChatHistoryState => ({ loading: false, error: null, loaded: false, hasPrevious: false, cursor: null })
+const MAX_CACHED_CHATS = 3
 
 export type ChatState = {
   userId: string | null
@@ -24,7 +35,9 @@ export type ChatState = {
   searching: boolean
   searchError: string | null
   openingUserId: string | null
-  messages: DisplayMessage[]
+  messagesByChat: MessagesByChat
+  historyByChat: ReadonlyMap<string, ChatHistoryState>
+  loadPreviousMessages(): Promise<void>
   loadingMailbox: boolean
   mailboxError: string | null
   sending: boolean
@@ -39,6 +52,7 @@ export type ChatState = {
   reloadMailbox(): Promise<void>
   // True means the message was accepted during the current lifecycle.
   sendText(content: string): Promise<boolean>
+  retryMessage(clientMessageId: string): Promise<void>
 }
 
 type ChatRun = {
@@ -47,16 +61,22 @@ type ChatRun = {
   searchRequest: number
   loadingMailbox: boolean
   reloadRequested: boolean
+  historyRequests: Map<string, object>
+  recentChats: string[]
   discoveredChats: Set<string>
   unsubscribe: () => void
   unsubscribeReady: () => void
+  unsubscribeOutgoing: () => void
+  unsubscribeDelivery: () => void
+  unsubscribeActivity: () => void
 }
 
 function initialState() {
   return {
     userId: null, chats: [], selectedChat: null, loadingChats: true, loadingChatId: null,
     chatsError: null, search: '', searchResults: null, searching: false, searchError: null,
-    openingUserId: null, messages: [], loadingMailbox: true, mailboxError: null,
+    openingUserId: null, messagesByChat: new Map<string, DisplayMessage[]>(), loadingMailbox: true, mailboxError: null,
+    historyByChat: new Map<string, ChatHistoryState>(),
     sending: false, sendError: null,
   }
 }
@@ -77,13 +97,16 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
   let run: ChatRun | null = null
 
   return createStore<ChatState>()((set, get) => {
-    function receive(current: ChatRun, messages: DisplayMessage[]) {
+    function receive(current: ChatRun, messages: DisplayMessage[], chatIds = messages.map(message => message.chatId)) {
       if (run !== current) return
-      set((state) => ({ messages: mergeMessages(state.messages, messages) }))
-      for (const message of messages) {
-        if (current.discoveredChats.has(message.chatId)) continue
-        current.discoveredChats.add(message.chatId)
-        void gateway.getChat(message.chatId).then((chat) => {
+      set((state) => {
+        const messagesByChat = mergeMessagesByChat(state.messagesByChat, messenger.loadChatHistory ? messages.filter(message => state.historyByChat.has(message.chatId)) : messages)
+        return messagesByChat === state.messagesByChat ? state : { messagesByChat }
+      })
+      for (const chatId of chatIds) {
+        if (current.discoveredChats.has(chatId)) continue
+        current.discoveredChats.add(chatId)
+        void gateway.getChat(chatId).then((chat) => {
           if (run === current) {
             set((state) => ({ chats: upsertChat(state.chats, chat) }))
             void messenger.cacheChats?.([chat]).catch((error: unknown) => {
@@ -91,9 +114,45 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
             })
           }
         }).catch((error: unknown) => {
-          current.discoveredChats.delete(message.chatId)
+          current.discoveredChats.delete(chatId)
           if (run === current) set({ chatsError: errorMessage(error) })
         })
+      }
+    }
+
+    function retainHistory(current: ChatRun, chatId: string) {
+      if (!messenger.loadChatHistory) return
+      current.recentChats = [chatId, ...current.recentChats.filter(id => id !== chatId)].slice(0, MAX_CACHED_CHATS)
+      const retained = new Set(current.recentChats)
+      for (const id of current.historyRequests.keys()) if (!retained.has(id)) current.historyRequests.delete(id)
+      set(state => ({
+        messagesByChat: new Map([...state.messagesByChat].filter(([id]) => retained.has(id))),
+        historyByChat: new Map([...state.historyByChat].filter(([id]) => retained.has(id))),
+      }))
+      messenger.setHistoryChats?.(current.recentChats)
+    }
+
+    async function loadHistory(current: ChatRun, chatId: string, previous = false) {
+      if (run !== current || !messenger.loadChatHistory) return
+      const history = get().historyByChat.get(chatId) ?? emptyHistory()
+      if (history.loading || (previous ? !history.hasPrevious : history.loaded)) return
+      const request = {}
+      current.historyRequests.set(chatId, request)
+      const isCurrent = () => run === current && current.historyRequests.get(chatId) === request
+      set(state => ({ historyByChat: new Map(state.historyByChat).set(chatId, { ...history, loading: true, error: null }) }))
+      try {
+        const page = await messenger.loadChatHistory(chatId, previous ? history.cursor ?? undefined : undefined)
+        if (!isCurrent()) return
+        set(state => ({
+          messagesByChat: mergeMessagesByChat(state.messagesByChat, page.messages),
+          historyByChat: new Map(state.historyByChat).set(chatId, {
+            loading: false, error: null, loaded: true, hasPrevious: page.nextBefore !== null, cursor: page.nextBefore,
+          }),
+        }))
+      } catch (error) {
+        if (isCurrent()) set(state => ({ historyByChat: new Map(state.historyByChat).set(chatId, { ...history, loading: false, error: errorMessage(error) }) }))
+      } finally {
+        if (isCurrent()) current.historyRequests.delete(chatId)
       }
     }
 
@@ -101,9 +160,10 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
       if (run !== current) return
       if (current.loadingMailbox) { current.reloadRequested = true; return }
       current.loadingMailbox = true
+      set({ loadingMailbox: true })
       try {
         const result = await messenger.loadMailbox()
-        receive(current, result.messages)
+        receive(current, result.messages, [...new Set([...result.messages.map(message => message.chatId), ...result.envelopes.map(envelope => envelope.chat_id)])])
         if (run === current) set({ mailboxError: null })
       } catch (error) {
         if (run === current) set({ mailboxError: errorMessage(error) })
@@ -145,25 +205,38 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         get().dispose()
         const current: ChatRun = {
           userId, selection: 0, searchRequest: 0, loadingMailbox: false, reloadRequested: false,
-          discoveredChats: new Set(), unsubscribe: () => {}, unsubscribeReady: () => {},
+          historyRequests: new Map(), recentChats: [],
+          discoveredChats: new Set(), unsubscribe: () => {}, unsubscribeReady: () => {}, unsubscribeOutgoing: () => {}, unsubscribeDelivery: () => {}, unsubscribeActivity: () => {},
         }
         run = current
         set({ userId })
+        messenger.setHistoryChats?.([])
         current.unsubscribe = messenger.subscribe(
-          (message) => receive(current, [message]),
+          (messages) => receive(current, messages),
           (error) => { if (run === current) set({ mailboxError: errorMessage(error) }) },
         )
+        current.unsubscribeActivity = messenger.onChatActivity?.(ids => receive(current, [], ids)) ?? (() => {})
+        current.unsubscribeOutgoing = messenger.onOutgoing?.(messages => receive(current, messages)) ?? (() => {})
+        current.unsubscribeDelivery = messenger.onDelivery?.(update => {
+          if (run !== current) return
+          const message = get().messagesByChat.get(update.chatId)?.find(item => item.messageId === update.messageId)
+          if (message) receive(current, [{ ...message, ...update }])
+        }) ?? (() => {})
         // Cover messages arriving during connection setup and reconnects.
         current.unsubscribeReady = messenger.onReady(() => { void loadMailbox(current) })
-        if (messenger.restoreLocal) {
+        const restore = messenger.restoreMetadata ?? messenger.restoreLocal
+        if (restore) {
           try {
-            const local = await messenger.restoreLocal()
+            const local = await restore.call(messenger)
             if (run !== current) return
-            set((state) => ({ chats: state.chats.reduce(upsertChat, local.chats), messages: mergeMessages(state.messages, local.messages) }))
+            set((state) => ({ chats: state.chats.reduce(upsertChat, local.chats), messagesByChat: mergeMessagesByChat(state.messagesByChat, local.messages) }))
             for (const chat of local.chats) current.discoveredChats.add(chat.id)
             const selectedChat = local.chats.length ? await preferences.restore(userId, local.chats) : null
             if (run !== current) return
-            if (current.selection === 0) set({ selectedChat })
+            if (current.selection === 0) {
+              set({ selectedChat })
+              if (selectedChat) { retainHistory(current, selectedChat.id); await loadHistory(current, selectedChat.id) }
+            }
           } catch (error) {
             if (run === current) set({ mailboxError: errorMessage(error) })
           }
@@ -177,6 +250,10 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         run = null
         previous?.unsubscribe()
         previous?.unsubscribeReady()
+        previous?.unsubscribeOutgoing()
+        previous?.unsubscribeDelivery()
+        previous?.unsubscribeActivity()
+        messenger.setHistoryChats?.([])
         set(initialState())
       },
 
@@ -186,6 +263,8 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         const request = ++current.selection
         const isCurrent = () => run === current && request === current.selection
         set({ selectedChat: chat, loadingChatId: chat.id, chatsError: null, sendError: null })
+        retainHistory(current, chat.id)
+        const historyLoad = loadHistory(current, chat.id)
         try {
           await preferences.select(current.userId, chat.id)
           if (!isCurrent()) return
@@ -201,6 +280,7 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
             if (isCurrent()) set({ chatsError: errorMessage(storageError) })
           }
         } finally {
+          await historyLoad
           if (isCurrent()) set({ loadingChatId: null })
         }
       },
@@ -236,6 +316,9 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
           if (!isCurrent()) return
           current.searchRequest += 1
           set({ selectedChat: chat, chatsError: null, sendError: null, search: '', searchResults: null, searching: false })
+          retainHistory(current, chat.id)
+          await loadHistory(current, chat.id)
+          if (!isCurrent()) return
           await preferences.select(current.userId, chat.id)
         } catch (error) {
           if (isCurrent()) set({ searchError: errorMessage(error) })
@@ -244,7 +327,20 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         }
       },
 
+      async loadPreviousMessages() {
+        const chatId = get().selectedChat?.id
+        if (run && chatId) await loadHistory(run, chatId, get().historyByChat.get(chatId)?.loaded ?? false)
+      },
+
       async reloadMailbox() { if (run) await loadMailbox(run) },
+
+      async retryMessage(clientMessageId) {
+        const current = run
+        if (!current) return
+        set({ sendError: null })
+        try { await messenger.retryOutgoing?.(clientMessageId) }
+        catch (error) { if (run === current) set({ sendError: errorMessage(error) }) }
+      },
 
       async sendText(content) {
         const current = run
@@ -255,10 +351,10 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         try {
           const accepted = await messenger.sendText(chat.id, content)
           if (run !== current) return false
-          set((state) => ({ messages: mergeMessages(state.messages, [{
+          receive(current, [{
             messageId: accepted.id, chatId: accepted.chatId, senderUserId: accepted.senderUserId,
-            content, createdAt: accepted.createdAt,
-          }]) }))
+            content, createdAt: accepted.createdAt, clientMessageId: accepted.clientMessageId, senderDeviceId: accepted.senderDeviceId, status: 'accepted',
+          }])
           return true
         } catch (error) {
           if (run === current && request === current.selection) set({ sendError: errorMessage(error) })

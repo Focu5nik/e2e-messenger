@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ClientError } from '@secure-messenger/client-core'
 import { ApiError } from '../src/shared/api/errors.ts'
-import { currentUserDto, deviceDto, timestamp, tokensDto, userDto } from './apiFixtures.ts'
+import { currentUserDto, deviceDto, envelopeDto, sentMessageDto, timestamp, tokensDto, userDto } from './apiFixtures.ts'
 
 const removedStorageKeys: string[] = []
 const lockNames: string[] = []
@@ -55,6 +55,31 @@ function tokenResponse(accessToken: string): Response {
 }
 
 const { ApiClient } = await import('../src/shared/api/client.ts')
+
+test('V6 HTTP acknowledgements and acceptance recovery validate responses and distinguish absence from failure', async () => {
+  const receipt = { ...envelopeDto, payload: null, delivered_at: timestamp, payload_purged_at: timestamp }
+  let status = 200
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.endsWith('/auth/login')) return tokenResponse('access-token')
+    assert.equal(new Headers(init.headers).get('Authorization'), 'Bearer access-token')
+    if (url.endsWith('/messages/envelopes/envelope%2F1/ack')) {
+      assert.equal(init.method, 'POST')
+      return Response.json(receipt)
+    }
+    assert.ok(url.endsWith('/messages/by-client-id/client%2F1'))
+    if (status !== 200) return Response.json({ detail: 'Lookup unavailable' }, { status })
+    return Response.json(sentMessageDto)
+  }
+  const client = new ApiClient()
+  await client.login('alice', 'password', { id: 'device', name: 'Browser' })
+  assert.deepEqual(await client.acknowledgeEnvelope('envelope/1'), receipt)
+  assert.equal((await client.findSentMessage('client/1'))?.id, sentMessageDto.id)
+  status = 404
+  assert.equal(await client.findSentMessage('client/1'), null)
+  status = 503
+  await assert.rejects(client.findSentMessage('client/1'), (error: unknown) => error instanceof ApiError && error.status === 503)
+})
 
 test('login uses the cookie lock and keeps only the access token in memory', async () => {
   removedStorageKeys.length = 0

@@ -628,12 +628,32 @@ form input:hover { border-color: #a8bbb2; }
   white-space: pre-wrap;
 }
 
-.message time {
-  display: block;
+.message-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
   margin-top: 5px;
   color: #75837e;
   font-size: 10px;
-  text-align: right;
+}
+
+.message-meta small { font-size: inherit; }
+
+.message-retry {
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 4px;
+  color: #176347;
+  background: transparent;
+  font-size: inherit;
+  font-weight: 650;
+}
+
+.message-retry:hover:not(:disabled) {
+  background: rgb(20 116 86 / 8%);
+  text-decoration: underline;
 }
 
 .message-composer {

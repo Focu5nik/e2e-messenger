@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Select, select, update
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -11,6 +11,40 @@ from app.messages.models import DeviceMailbox, Message, MessageEnvelope
 
 
 class MessageRepository:
+    async def acknowledge(
+        self,
+        session: AsyncSession,
+        device_id: uuid.UUID,
+        envelope_id: uuid.UUID,
+        now: datetime,
+    ) -> tuple[MessageEnvelope, uuid.UUID] | None:
+        # Authorization and the entire transition share one row-locked UPDATE.
+        # COALESCE preserves the first receipt/purge time on concurrent retries,
+        # including a delayed ACK for content already removed by expiry.
+        envelope = await session.scalar(
+            update(MessageEnvelope)
+            .where(
+                MessageEnvelope.id == envelope_id,
+                MessageEnvelope.recipient_device_id == device_id,
+            )
+            .values(
+                delivered_at=func.coalesce(MessageEnvelope.delivered_at, now),
+                payload=None,
+                payload_purged_at=func.coalesce(MessageEnvelope.payload_purged_at, now),
+            )
+            .returning(MessageEnvelope)
+            .execution_options(populate_existing=True)
+        )
+        if envelope is None:
+            return None
+        sender_device_id = await session.scalar(
+            select(Message.sender_device_id)
+            .join(Message.envelopes)
+            .where(MessageEnvelope.id == envelope_id)
+        )
+        assert sender_device_id is not None
+        return envelope, sender_device_id
+
     async def lock_device_set(
         self,
         session: AsyncSession,

@@ -12,7 +12,7 @@ from app.auth.dependencies import Principal
 from app.auth.models import Device
 from app.messages.models import Message, MessageEnvelope
 from app.messages.repository import MessageRepository
-from app.messages.responses import mailbox_envelope_response
+from app.messages.responses import envelope_response, mailbox_envelope_response
 from app.messages.schemas import (
     MAX_ENVELOPE_PAYLOAD_BYTES,
     PLAINTEXT_ENVELOPE_TYPE,
@@ -27,6 +27,10 @@ PAYLOAD_RETENTION = timedelta(days=45)
 
 
 class ChatNotFoundError(Exception):
+    pass
+
+
+class EnvelopeNotFoundError(Exception):
     pass
 
 
@@ -74,6 +78,58 @@ class MessageService:
         self.repository = repository or MessageRepository()
         self.event_bus = event_bus
 
+    async def lookup(
+        self,
+        session: AsyncSession,
+        principal: Principal,
+        client_message_id: uuid.UUID,
+    ) -> StoredMessage | None:
+        existing = await self.repository.get_message_by_client_id(
+            session, principal.device_id, client_message_id
+        )
+        if existing is None:
+            return None
+        await self.repository.purge_expired_for_message(
+            session, existing[0].id, datetime.now(UTC)
+        )
+        await session.commit()
+        refreshed = await self.repository.get_message_by_client_id(
+            session, principal.device_id, client_message_id
+        )
+        if refreshed is None:
+            raise MailboxInvariantError("an idempotent message disappeared")
+        return StoredMessage(*refreshed)
+
+    async def acknowledge(
+        self,
+        session: AsyncSession,
+        principal: Principal,
+        envelope_id: uuid.UUID,
+    ) -> MessageEnvelope:
+        acknowledged = await self.repository.acknowledge(
+            session, principal.device_id, envelope_id, datetime.now(UTC)
+        )
+        if acknowledged is None:
+            raise EnvelopeNotFoundError
+        envelope, sender_device_id = acknowledged
+        await session.commit()
+        if self.event_bus is not None:
+            try:
+                await asyncio.wait_for(
+                    self.event_bus.publish(
+                        sender_device_id,
+                        {
+                            "type": "message.delivered",
+                            "data": envelope_response(envelope).model_dump(mode="json"),
+                        },
+                    ),
+                    timeout=5,
+                )
+            except Exception:
+                # Sender recovery reads the retained receipt if the socket fails.
+                pass
+        return envelope
+
     async def destination_devices(
         self,
         session: AsyncSession,
@@ -93,22 +149,9 @@ class MessageService:
         principal: Principal,
         request: SendMessageRequest,
     ) -> StoredMessage:
-        existing = await self.repository.get_message_by_client_id(
-            session, principal.device_id, request.client_message_id
-        )
+        existing = await self.lookup(session, principal, request.client_message_id)
         if existing is not None:
-            message, _ = existing
-            now = datetime.now(UTC)
-            await self.repository.purge_expired_for_message(
-                session, message.id, now
-            )
-            await session.commit()
-            refreshed = await self.repository.get_message_by_client_id(
-                session, principal.device_id, request.client_message_id
-            )
-            if refreshed is None:  # Metadata retention is permanent in V3.
-                raise MailboxInvariantError("an idempotent message disappeared")
-            return StoredMessage(*refreshed)
+            return existing
 
         other_user_id = await self.repository.get_other_user_id(
             session, principal.user_id, request.chat_id

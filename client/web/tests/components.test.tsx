@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { after, afterEach, beforeEach, mock, test } from 'node:test'
 import { JSDOM } from 'jsdom'
 import { ChatPreferencesService, ClientError, createChatStore, createSessionStore, DeviceIdentityService, MessengerService, PlaintextMessageCodec } from '@secure-messenger/client-core'
-import type { CurrentUserDto, DeviceDto, DeviceIdentity, DirectChatDto, MailboxEnvelope, RealtimeGateway } from '@secure-messenger/client-core'
+import type { CurrentUserDto, DeviceDto, DeviceIdentity, DirectChatDto, DisplayMessage, MailboxEnvelope, RealtimeGateway } from '@secure-messenger/client-core'
 import { mailboxEnvelopeDto, sentMessageDto } from './apiFixtures.ts'
 import { browserDeviceDescription } from '../src/shared/platform/deviceDescription.ts'
 import { browserIdGenerator, browserTextEncoding } from '../src/shared/platform/messaging.ts'
@@ -229,6 +229,44 @@ test('the composer preserves Enter, Shift+Enter and composition handling and scr
   })
   assert.equal(container.querySelectorAll('.message').length, 2)
   assert.equal(stage.scrollTop, 400)
+})
+
+test('message retry stays hidden during sending and recovery and remains available after failure', async () => {
+  const client = await renderApp()
+  await click('.chat-list li:first-child button')
+  let retries = 0
+  let finishRetry!: () => void
+  await act(async () => client.chatStore.setState({
+    sending: true,
+    messagesByChat: new Map([['bob-chat', [{
+      messageId: 'pending-message', chatId: 'bob-chat', senderUserId: user.id,
+      senderDeviceId: identity.id, clientMessageId: 'pending-client',
+      content: 'Hello', createdAt: user.created_at, status: 'pending',
+    }]]]),
+    retryMessage: async (id) => {
+      assert.equal(id, 'pending-client')
+      retries++
+      await new Promise<void>(resolve => { finishRetry = resolve })
+    },
+  }))
+  assert.ok(!container.querySelector('.message button'), 'Retry must stay hidden while sending')
+  await act(async () => client.chatStore.setState({ sending: false, loadingMailbox: true }))
+  assert.ok(!container.querySelector('.message button'), 'Retry must stay hidden during recovery')
+  await act(async () => client.chatStore.setState({ loadingMailbox: false }))
+  assert.equal(element('.message button').textContent, 'Retry')
+  await click('.message button')
+  assert.equal(retries, 1)
+  assert.equal(element<HTMLButtonElement>('.message button').disabled, true)
+  await click('.message button')
+  assert.equal(retries, 1)
+  await act(async () => finishRetry())
+  assert.equal(element<HTMLButtonElement>('.message button').disabled, false)
+  await act(async () => client.chatStore.setState(state => ({
+    messagesByChat: new Map([['bob-chat', state.messagesByChat.get('bob-chat')!.map(message => ({
+      ...message, messageId: 'accepted-message', status: 'accepted' as const,
+    }))]]),
+  })))
+  assert.ok(!container.querySelector('.message button'), 'Accepted messages must not offer Retry')
 })
 
 test('App waits for device identity storage before restoring the session', async () => {
@@ -757,4 +795,91 @@ test('logout failure still returns to sign-in with a warning and stops realtime'
   assert.equal(element('[role="alert"]').textContent,
     'The server could not confirm sign-out. Reconnect and sign out again: Server unavailable')
   assert.equal(stops, 1)
+})
+
+
+test('long histories virtualize rows and preserve the visible anchor when older messages are prepended', async () => {
+  const { MessageHistory } = await import('../src/features/chats/components/MessageHistory.tsx')
+  const proto = dom.window.HTMLElement.prototype
+  const originals = new Map(['clientHeight', 'scrollHeight', 'scrollTop'].map(key => [key, Object.getOwnPropertyDescriptor(proto, key)]))
+  const scrollPositions = new WeakMap<object, number>()
+  Object.defineProperties(proto, {
+    clientHeight: { configurable: true, get() { return 500 } },
+    scrollHeight: { configurable: true, get() {
+      return Number.parseFloat((this as HTMLElement).querySelector<HTMLElement>('ol')?.style.height ?? '500')
+    } },
+    scrollTop: { configurable: true, get() { return scrollPositions.get(this) ?? 0 }, set(value: number) {
+      scrollPositions.set(this, Math.max(0, Math.min(value, (this as HTMLElement).scrollHeight - 500)))
+    } },
+  })
+  try {
+    const makeMessage = (index: number) => ({ messageId: `virtual-${index}`, chatId: 'chat', senderUserId: 'other',
+      content: `Message ${index}`, createdAt: '2026-09-01T00:00:00Z' })
+    const messages = Array.from({ length: 1000 }, (_, index) => makeMessage(index))
+    let loads = 0
+    const render = (items: DisplayMessage[]) => root.render(<MessageHistory messages={items} userId="alice"
+      history={{ loading: false, loaded: true, error: null, hasPrevious: true, cursor: { createdAt: '', id: 'cursor' } }}
+      syncError={null} loadPrevious={async () => { loads++ }} retryMessage={async () => {}}>Empty</MessageHistory>)
+    await act(async () => render(messages))
+    assert.ok(container.querySelectorAll('li').length < 25)
+    const stage = container.querySelector<HTMLElement>('.message-stage')!
+    assert.equal(stage.scrollTop, stage.scrollHeight - stage.clientHeight)
+    for (const distance of [10, 20, 40]) {
+      const target = stage.scrollHeight - stage.clientHeight - distance
+      await act(async () => {
+        stage.scrollTop = target
+        stage.dispatchEvent(new dom.window.Event('scroll', { bubbles: true }))
+      })
+      assert.equal(stage.scrollTop, target, 'Small upward scrolls must not snap back to the bottom')
+    }
+    const readingPosition = stage.scrollTop
+    await act(async () => render([...messages, makeMessage(1000)]))
+    assert.equal(stage.scrollTop, readingPosition, 'New messages must preserve the reading position')
+    const outgoing: DisplayMessage = {
+      ...makeMessage(1001), senderUserId: 'alice', senderDeviceId: 'alice-device',
+      clientMessageId: 'outgoing-client', status: 'pending',
+    }
+    await act(async () => render([...messages, makeMessage(1000), outgoing]))
+    assert.equal(stage.scrollTop, stage.scrollHeight - stage.clientHeight, 'Sending a new message must scroll to the bottom')
+    await act(async () => {
+      stage.scrollTop -= 40
+      stage.dispatchEvent(new dom.window.Event('scroll', { bubbles: true }))
+    })
+    const positionAfterSending = stage.scrollTop
+    const accepted: DisplayMessage = { ...outgoing, messageId: 'server-message', status: 'accepted' }
+    await act(async () => render([...messages, makeMessage(1000), accepted]))
+    assert.equal(stage.scrollTop, positionAfterSending, 'Acceptance must not undo scrolling after sending')
+    await act(async () => render([
+      { ...makeMessage(-1), senderUserId: 'alice' }, ...messages, makeMessage(1000), accepted,
+    ]))
+    assert.equal(stage.scrollTop, positionAfterSending + 100, 'Loading older outgoing messages must preserve the anchor')
+    await act(async () => {
+      stage.scrollTop = stage.scrollHeight
+      stage.dispatchEvent(new dom.window.Event('scroll', { bubbles: true }))
+    })
+    await act(async () => render([...messages, makeMessage(1000), makeMessage(1001)]))
+    assert.equal(stage.scrollTop, stage.scrollHeight - stage.clientHeight, 'Returning to the bottom must resume following new messages')
+    await act(async () => render(messages))
+    await act(async () => {
+      stage.scrollTop = 10000
+      stage.dispatchEvent(new dom.window.Event('scroll', { bubbles: true }))
+    })
+    const visible = container.querySelector<HTMLElement>('[data-key="virtual-100"]')!
+    assert.ok(visible)
+    const offset = Number.parseFloat(visible.style.top) - stage.scrollTop
+    await act(async () => render([...Array.from({ length: 50 }, (_, index) => makeMessage(index - 50)), ...messages]))
+    const preserved = container.querySelector<HTMLElement>('[data-key="virtual-100"]')!
+    assert.equal(Number.parseFloat(preserved.style.top) - stage.scrollTop, offset)
+    assert.ok(container.querySelectorAll('li').length < 25)
+    await act(async () => {
+      stage.scrollTop = 0
+      stage.dispatchEvent(new dom.window.Event('scroll', { bubbles: true }))
+    })
+    assert.equal(loads, 1)
+  } finally {
+    for (const [key, descriptor] of originals) {
+      if (descriptor) Object.defineProperty(proto, key, descriptor)
+      else Reflect.deleteProperty(proto, key)
+    }
+  }
 })

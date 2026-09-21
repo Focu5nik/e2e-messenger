@@ -103,7 +103,7 @@ async def test_bidirectional_delivery_http_send_and_no_ack(client, session_facto
         # A retry returns the same metadata without creating another live event.
         await alice_ws.send({"type": "message.send", "request_id": "retry", "data": request})
         assert (await alice_ws.event())["data"]["id"] == accepted["data"]["id"]
-        await bob_ws.send({"type": "message.delivered", "request_id": "ack", "data": {"envelope_id": incoming["data"]["id"]}})
+        await bob_ws.send({"type": "message.ack", "request_id": "ack", "data": {"envelope_id": incoming["data"]["id"]}})
         error = await bob_ws.event()
         assert error["error"]["code"] == "unsupported_event"
         assert error["request_id"] == "ack"
@@ -339,3 +339,56 @@ async def test_websocket_accepts_same_large_envelope_array_as_http(client, sessi
         event = await socket.event()
         assert event["type"] == "message.accepted"
         assert len(event["data"]["envelopes"]) == 12
+
+
+async def test_delivery_ack_commits_purge_before_receipts_and_replays_safely(client, session_factory):
+    alice, _, alice_token = await create_authenticated_user(session_factory, "alice-ack-ws")
+    bob, devices, bob_token = await create_authenticated_user(session_factory, "bob-ack-ws")
+    chat = await create_direct_chat(session_factory, alice.id, bob.id)
+    async with Socket(alice_token) as sender, Socket(bob_token) as recipient:
+        await sender.ready()
+        await recipient.ready()
+        body = send_body(chat.id, devices)
+        await sender.send({"type": "message.send", "request_id": "send", "data": body})
+        accepted = await sender.event()
+        incoming = await recipient.event()
+        async with session_factory() as session:
+            assert await session.get(Message, uuid.UUID(accepted["data"]["id"])) is not None
+        envelope_id = incoming["data"]["id"]
+
+        # Even the original sender cannot acknowledge a recipient's envelope.
+        await sender.send({"type": "message.delivered", "request_id": "forbidden", "data": {"envelope_id": envelope_id}})
+        denied = await sender.event()
+        assert denied["error"]["status"] == 404
+        await recipient.send({"type": "message.delivered", "request_id": "invalid", "data": {"envelope_id": "invalid"}})
+        assert (await recipient.event())["error"]["status"] == 422
+
+        first_receipt = None
+        for request_id in ("ack", "retry-after-lost-ack-response"):
+            await recipient.send({"type": "message.delivered", "request_id": request_id, "data": {"envelope_id": envelope_id}})
+            ack = await recipient.event()
+            receipt = await sender.event()
+            assert ack["type"] == receipt["type"] == "message.delivered"
+            assert ack["request_id"] == request_id
+            assert "request_id" not in receipt
+            assert ack["data"] == receipt["data"]
+            assert receipt["data"]["payload"] is None
+            assert receipt["data"]["delivered_at"] is not None
+            if first_receipt is not None:
+                assert receipt == first_receipt
+            first_receipt = receipt
+            async with session_factory() as session:
+                persisted = await session.get(MessageEnvelope, uuid.UUID(envelope_id))
+                assert persisted.payload is None
+                assert persisted.delivered_at is not None
+                assert persisted.payload_purged_at is not None
+
+        # Recover acceptance and receipt after a lost live response, without replay.
+        recovered = await client.get(f"/messages/by-client-id/{body['client_message_id']}", headers=bearer(alice_token))
+        assert recovered.json()["id"] == accepted["data"]["id"]
+        assert recovered.json()["envelopes"] == [first_receipt["data"]]
+        await sender.send({"type": "message.send", "request_id": "retry", "data": body})
+        retry = await sender.event()
+        assert retry["data"] == recovered.json()
+        async with session_factory() as session:
+            assert await session.scalar(select(func.count()).select_from(Message)) == 1

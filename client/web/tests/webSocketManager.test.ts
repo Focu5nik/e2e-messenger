@@ -278,3 +278,48 @@ test('a synchronous socket send failure rejects as unconfirmed and clears its co
   assert.equal(timers.size, 0)
   manager.stop()
 })
+
+
+test('V6 ACK serialization correlates recipient responses separately from sender delivery events', async () => {
+  const { manager, sockets } = setup()
+  manager.start()
+  await Promise.resolve()
+  const socket = sockets[0]
+  socket.open()
+  socket.receive({ type: 'auth.ok' })
+  const deliveries: string[] = []
+  const unsubscribe = manager.onDelivered(envelope => deliveries.push(envelope.id))
+  const ack = manager.acknowledgeEnvelope(mailboxEnvelopeDto.id)
+  const frame = JSON.parse(socket.sent[1])
+  assert.equal(frame.type, 'message.delivered')
+  assert.deepEqual(frame.data, { envelope_id: mailboxEnvelopeDto.id })
+  const receipt = { ...sentMessageDto.envelopes[0], payload: null, delivered_at: timestamp, payload_purged_at: timestamp }
+  socket.receive({ type: 'message.delivered', request_id: frame.request_id, data: receipt })
+  assert.deepEqual(await ack, receipt)
+  assert.deepEqual(deliveries, [])
+  socket.receive({ type: 'message.delivered', data: receipt })
+  assert.deepEqual(deliveries, [receipt.id])
+  unsubscribe()
+  socket.receive({ type: 'message.delivered', data: receipt })
+  assert.equal(deliveries.length, 1)
+  manager.stop()
+})
+
+test('V6 interrupted ACKs reject and release pending timers for durable retry', async () => {
+  for (const failure of ['error', 'timeout', 'disconnect'] as const) {
+    const { manager, sockets, timers, runTimer } = setup()
+    manager.start()
+    await Promise.resolve()
+    const socket = sockets[0]
+    socket.open()
+    socket.receive({ type: 'auth.ok' })
+    const ack = manager.acknowledgeEnvelope('envelope')
+    const { request_id } = JSON.parse(socket.sent[1])
+    if (failure === 'error') socket.receive({ type: 'error', request_id, error: { code: 'envelope_not_found', message: 'Unavailable', status: 404 } })
+    else if (failure === 'timeout') runTimer(15_000)
+    else manager.stop()
+    await assert.rejects(ack)
+    manager.stop()
+    assert.equal(timers.size, 0)
+  }
+})

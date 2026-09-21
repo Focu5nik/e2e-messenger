@@ -82,6 +82,7 @@ export type ErrorDetail =
 export type ErrorResponse = { detail?: ErrorDetail }
 
 export type ServerEvent =
+  | { type: 'message.delivered'; request_id?: string; data: MessageEnvelope }
   | { type: 'auth.ok' }
   | { type: 'message.new'; data: MailboxEnvelope }
   | { type: 'message.accepted'; request_id: string; data: SentMessageDto }
@@ -89,6 +90,7 @@ export type ServerEvent =
   | { type: 'error'; request_id?: string; error: { code: string; message: string; status: number } }
 
 export type ClientEvent =
+  | { type: 'message.delivered'; request_id: string; data: { envelope_id: string } }
   | { type: 'auth'; access_token: string }
   | { type: 'message.send'; request_id: string; data: SendMessageRequest }
   | { type: 'sync.request'; request_id: string; data: { after_seq: number; limit: number } }

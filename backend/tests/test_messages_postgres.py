@@ -240,6 +240,48 @@ async def test_concurrent_sends_keep_sequences_contiguous_and_are_idempotent() -
             assert sequences == [1, 2, 3]
             assert mailbox is not None
             assert mailbox.last_seq == 3
+
+            envelope = await session.scalar(
+                select(MessageEnvelope).where(
+                    MessageEnvelope.message_id == repeated_ids[0]
+                )
+            )
+            assert envelope is not None
+            envelope_id = envelope.id
+
+        # Two ACK requests racing after a lost response must converge on the
+        # first delivery/purge timestamps and preserve the idempotency row.
+        async def acknowledge_once() -> tuple[datetime, datetime]:
+            async with session_factory() as session:
+                acknowledged = await MessageService().acknowledge(
+                    session,
+                    Principal(
+                        user_id=bob_id,
+                        device_id=bob_device_id,
+                        session_id=uuid.uuid4(),
+                    ),
+                    envelope_id,
+                )
+                assert acknowledged.payload is None
+                assert acknowledged.delivered_at is not None
+                assert acknowledged.payload_purged_at is not None
+                return acknowledged.delivered_at, acknowledged.payload_purged_at
+
+        receipts = await asyncio.gather(acknowledge_once(), acknowledge_once())
+        assert receipts[0] == receipts[1]
+        assert receipts[0][0] == receipts[0][1]
+        recovered_id = await send_once(
+            MessageService(), alice_device_ids[0], shared_client_message_id
+        )
+        assert recovered_id == repeated_ids[0]
+        async with session_factory() as session:
+            retained = await session.get(MessageEnvelope, envelope_id)
+            assert retained is not None
+            assert retained.payload is None
+            assert retained.mailbox_seq == 3
+            mailbox = await session.get(DeviceMailbox, bob_device_id)
+            assert mailbox is not None
+            assert mailbox.last_seq == 3
     finally:
         async with session_factory() as session:
             if message_ids:

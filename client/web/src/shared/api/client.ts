@@ -1,11 +1,11 @@
 import type {
   AccountGateway, ChatGateway, MessagingGateway, SessionGateway,
   CredentialsRequest, CurrentUser, DestinationDevice, Device, DirectChat, LoginDevice,
-  LoginRequest, MailboxPage, SendMessageRequest, SentMessage, TokenResponse, User,
+  LoginRequest, MailboxPage, MessageEnvelope, SendMessageRequest, SentMessage, TokenResponse, User,
 } from '@secure-messenger/client-core'
 import {
   mapCurrentUser, mapDestinationDevice, mapDevice, mapDirectChat, mapEmpty, mapError,
-  mapList, mapMailboxPage, mapSentMessage, mapTokens, mapUser,
+  mapList, mapMailboxPage, mapMessageEnvelope, mapSentMessage, mapTokens, mapUser,
 } from './mappers.ts'
 import { ApiError } from './errors.ts'
 
@@ -174,6 +174,19 @@ export class ApiClient implements SessionGateway, AccountGateway, ChatGateway, M
       method: 'POST',
       body: JSON.stringify(command),
     })
+  }
+
+  acknowledgeEnvelope(envelopeId: string): Promise<MessageEnvelope> {
+    return this.authenticatedRequest(mapMessageEnvelope, `/messages/envelopes/${encodeURIComponent(envelopeId)}/ack`, { method: 'POST' })
+  }
+
+  async findSentMessage(clientMessageId: string): Promise<SentMessage | null> {
+    try {
+      return await this.authenticatedRequest(mapSentMessage, `/messages/by-client-id/${encodeURIComponent(clientMessageId)}`)
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) return null
+      throw error
+    }
   }
 
   getMailbox(afterSeq: number, limit = 100): Promise<MailboxPage> {

@@ -32,6 +32,7 @@ export type SentMessage = {
 export type MailboxPage = { envelopes: MailboxEnvelope[]; nextSeq: number; hasMore: boolean }
 
 export type ReceivedMessage = {
+  historyId?: string
   envelopeId: string
   messageId: string
   chatId: string
@@ -46,4 +47,13 @@ export type ReceivedMessage = {
 export type DisplayMessage = Pick<
   ReceivedMessage,
   'messageId' | 'chatId' | 'senderUserId' | 'content' | 'createdAt'
->
+> & {
+  clientMessageId?: string
+  senderDeviceId?: string
+  // Immutable local history index tie-breaker.
+  historyId?: string
+  status?: 'pending' | 'accepted' | 'delivered'
+  deliveries?: Array<{ deviceId: string; deliveredAt: string | null }>
+}
+
+export type MessageDeliveryUpdate = Pick<DisplayMessage, 'messageId' | 'chatId' | 'status' | 'deliveries'>

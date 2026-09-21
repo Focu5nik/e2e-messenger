@@ -64,7 +64,7 @@ function setup() {
     async searchUsers(query) { calls.push(`search:${query}`); return [chats[0].otherUser] },
     async createDirectChat(userId) { calls.push(`create:${userId}`); return chats[0] },
   }
-  const listeners = new Map<(message: ReceivedMessage) => void, (error: unknown) => void>()
+  const listeners = new Map<(messages: ReceivedMessage[]) => void, (error: unknown) => void>()
   const readyListeners = new Set<() => void>()
   const sent: Array<{ chatId: string; content: string }> = []
   const messenger: ChatStoreDependencies['messenger'] = {
@@ -77,7 +77,7 @@ function setup() {
     async sendText(chatId, content) { sent.push({ chatId, content }); return accepted(chatId) },
   }
   const store = createChatStore({ chats: gateway, messenger, preferences })
-  const receive = (value: ReceivedMessage) => { for (const handler of listeners.keys()) handler(value) }
+  const receive = (value: ReceivedMessage) => { for (const handler of listeners.keys()) handler([value]) }
   const ready = () => { for (const handler of readyListeners) handler() }
   return { store, gateway, messenger, storage, preferences, calls, saved, writes, listeners, readyListeners, sent, receive, ready }
 }
@@ -89,7 +89,7 @@ test('cached messages and chat selection restore even when remote catch-up fails
   messenger.loadMailbox = async () => { throw new Error('Offline mailbox') }
   gateway.getChats = async () => { throw new Error('Offline chats') }
   await store.getState().start('alice')
-  assert.equal(store.getState().messages.length, 1)
+  assert.equal([...store.getState().messagesByChat.values()].flat().length, 1)
   assert.equal(store.getState().selectedChat?.id, chats[0].id)
   assert.equal(store.getState().mailboxError, 'Offline mailbox')
   store.getState().dispose()
@@ -321,9 +321,9 @@ test('live duplicates and accepted sends survive a late initial mailbox without 
   assert.equal(await store.getState().sendText('hello'), true)
   late.resolve(mailbox([message('old'), message('live'), { ...message('accepted'), content: 'hello' }]))
   await starting
-  assert.equal(store.getState().messages.length, 3)
-  assert.deepEqual(new Set(store.getState().messages.map((value) => value.messageId)), new Set(['live', 'old', 'accepted']))
-  assert.equal(store.getState().messages.find((value) => value.messageId === 'accepted')?.content, 'hello')
+  assert.equal([...store.getState().messagesByChat.values()].flat().length, 3)
+  assert.deepEqual(new Set([...store.getState().messagesByChat.values()].flat().map((value) => value.messageId)), new Set(['live', 'old', 'accepted']))
+  assert.equal([...store.getState().messagesByChat.values()].flat().find((value) => value.messageId === 'accepted')?.content, 'hello')
 })
 
 test('discovered chats are fetched once and survive an older chat-list response', async () => {
@@ -348,7 +348,7 @@ test('discovery failure retains the message and allows retry on a later envelope
   gateway.getChat = async () => { throw new Error('Discovery failed') }
   receive(message('live', discovered.id))
   await flush()
-  assert.equal(store.getState().messages.length, 1)
+  assert.equal([...store.getState().messagesByChat.values()].flat().length, 1)
   assert.equal(store.getState().chatsError, 'Discovery failed')
   gateway.getChat = async () => discovered
   receive(message('next', discovered.id))
@@ -371,7 +371,7 @@ test('ready events during a mailbox load coalesce into exactly one following rel
   second.resolve(mailbox([message('second')]))
   await flush()
   assert.equal(loads, 2)
-  assert.equal(store.getState().messages.length, 2)
+  assert.equal([...store.getState().messagesByChat.values()].flat().length, 2)
   assert.equal(store.getState().loadingMailbox, false)
 })
 
@@ -403,8 +403,8 @@ test('send preserves content and destination and rejects empty or duplicate subm
   late.resolve(accepted(chats[0].id))
   assert.equal(await sending, true)
   assert.deepEqual(sent, [{ chatId: chats[0].id, content: '  hello\n' }])
-  assert.equal(store.getState().messages[0].chatId, chats[0].id)
-  assert.equal(store.getState().messages[0].content, '  hello\n')
+  assert.equal([...store.getState().messagesByChat.values()].flat()[0].chatId, chats[0].id)
+  assert.equal([...store.getState().messagesByChat.values()].flat()[0].content, '  hello\n')
   assert.equal(store.getState().sending, false)
 })
 
@@ -421,7 +421,7 @@ test('send failure permits retry and does not place an old-chat error on a new s
     assert.equal(await sending, false)
     assert.equal(store.getState().sendError, changeSelection ? null : 'Send failed')
     assert.equal(store.getState().sending, false)
-    assert.deepEqual(store.getState().messages, [])
+    assert.deepEqual([...store.getState().messagesByChat.values()].flat(), [])
     messenger.sendText = async (id) => accepted(id)
     assert.equal(await store.getState().sendText('retry'), true)
     assert.equal(store.getState().sendError, null)
@@ -447,7 +447,7 @@ test('session replacement clears data and ignores old initial loads and queued r
   assert.equal(store.getState(), current)
   assert.equal(current.userId, 'other-user')
   assert.deepEqual(current.chats, [])
-  assert.deepEqual(current.messages, [])
+  assert.deepEqual([...current.messagesByChat.values()].flat(), [])
   assert.deepEqual(calls, ['new-mailbox'])
 })
 
@@ -505,7 +505,7 @@ test('disposal releases subscriptions, clears all state and makes old callbacks 
   assert.equal(listeners.size, 0)
   assert.equal(readyListeners.size, 0)
   assert.equal(store.getState().userId, null)
-  assert.deepEqual(store.getState().messages, [])
+  assert.deepEqual([...store.getState().messagesByChat.values()].flat(), [])
   assert.deepEqual(store.getState().chats, [])
   assert.equal(store.getState().selectedChat, null)
   assert.equal(store.getState().search, '')
@@ -514,9 +514,149 @@ test('disposal releases subscriptions, clears all state and makes old callbacks 
   assert.equal(listeners.size, 1)
   assert.equal(readyListeners.size, 1)
   const current = store.getState()
-  oldReceive(message('late'))
+  oldReceive([message('late')])
   oldError(new Error('Late decode failed'))
   oldReady()
   await flush()
   assert.equal(store.getState(), current)
+})
+
+test('outgoing batches update once, preserve other chats, and ignore identical message snapshots', async () => {
+  const { store, messenger, receive } = setup()
+  let outgoing!: Parameters<NonNullable<typeof messenger.onOutgoing>>[0]
+  messenger.onOutgoing = handler => { outgoing = handler; return () => {} }
+  await store.getState().start('alice')
+  receive(message('bob-message'))
+  receive(message('carol-message', chats[1].id))
+  await flush()
+  const bobMessages = store.getState().messagesByChat.get(chats[0].id)
+  let updates = 0
+  const unsubscribe = store.subscribe(() => { updates += 1 })
+  const batch = Array.from({ length: 100 }, (_, index) => message(`outgoing-${index}`, chats[1].id))
+  outgoing(batch)
+  assert.equal(updates, 1)
+  assert.equal(store.getState().messagesByChat.get(chats[0].id), bobMessages)
+  assert.equal(store.getState().messagesByChat.get(chats[1].id)?.length, 101)
+  const previous = store.getState()
+  outgoing(structuredClone(batch))
+  assert.equal(store.getState(), previous)
+  assert.equal(updates, 1)
+  unsubscribe()
+})
+
+
+test('incoming delta batches merge once and delivery updates preserve the existing message text', async () => {
+  const { store, messenger, listeners } = setup()
+  let deliver!: Parameters<NonNullable<typeof messenger.onDelivery>>[0]
+  messenger.onDelivery = handler => { deliver = handler; return () => {} }
+  await store.getState().start('alice')
+  // Discover the chat before measuring message-only state notifications.
+  for (const handler of listeners.keys()) handler([message('known')])
+  await flush()
+  let updates = 0
+  const unsubscribe = store.subscribe(() => { updates += 1 })
+  for (const handler of listeners.keys()) handler([message('one'), message('two'), message('three')])
+  assert.equal(updates, 1)
+  deliver({ messageId: 'two', chatId: chats[0].id, status: 'delivered', deliveries: [{ deviceId: 'device', deliveredAt: timestamp }] })
+  assert.equal(updates, 2)
+  const updated = store.getState().messagesByChat.get(chats[0].id)!.find(item => item.messageId === 'two')!
+  assert.equal(updated.content, 'two')
+  assert.equal(updated.status, 'delivered')
+  unsubscribe()
+  store.getState().dispose()
+})
+
+
+test('history opens only the selected chat, pages independently, and ignores duplicate updates', async () => {
+  const { store, messenger, receive } = setup()
+  const reads: Array<[string, unknown]> = []
+  const cursor = { createdAt: timestamp, id: 'older' }
+  messenger.restoreMetadata = async () => ({ ...mailbox(), chats })
+  messenger.restoreLocal = async () => { throw new Error('Full restoration forbidden') }
+  messenger.loadChatHistory = async (id, before) => {
+    reads.push([id, before])
+    return { messages: [message(before ? 'older' : 'latest', id)], nextBefore: before ? null : cursor }
+  }
+  await store.getState().start('alice')
+  assert.equal(reads.length, 0)
+  await store.getState().selectChat(chats[0])
+  assert.deepEqual(reads, [[chats[0].id, undefined]])
+  const first = store.getState().messagesByChat.get(chats[0].id)
+  receive(message('latest'))
+  assert.equal(store.getState().messagesByChat.get(chats[0].id), first)
+  const sync = deferred<MailboxLoadResult>()
+  messenger.loadMailbox = () => sync.promise
+  const reload = store.getState().reloadMailbox()
+  assert.equal(store.getState().historyByChat.get(chats[0].id)?.loading, false)
+  assert.equal(store.getState().messagesByChat.get(chats[0].id), first)
+  await store.getState().loadPreviousMessages()
+  assert.deepEqual(reads[1], [chats[0].id, cursor])
+  assert.equal(store.getState().messagesByChat.get(chats[0].id)?.length, 2)
+  assert.equal(store.getState().historyByChat.get(chats[0].id)?.hasPrevious, false)
+  await store.getState().loadPreviousMessages()
+  assert.equal(reads.length, 2)
+  sync.resolve(mailbox())
+  await reload
+  store.getState().dispose()
+})
+
+test('history requests coalesce, errors retry, and a user switch discards late pages', async () => {
+  const { store, messenger } = setup()
+  const pending = deferred<{ messages: ReceivedMessage[]; nextBefore: null }>()
+  let reads = 0
+  messenger.loadChatHistory = () => { reads++; return pending.promise }
+  await store.getState().start('alice')
+  const selection = store.getState().selectChat(chats[0])
+  await store.getState().loadPreviousMessages()
+  assert.equal(reads, 1)
+  await store.getState().start('other-user')
+  pending.resolve({ messages: [message()], nextBefore: null })
+  await selection
+  assert.equal(store.getState().messagesByChat.size, 0)
+  assert.equal(store.getState().historyByChat.size, 0)
+  messenger.loadChatHistory = async () => { throw new Error('History unavailable') }
+  await store.getState().selectChat(chats[0])
+  assert.equal(store.getState().historyByChat.get(chats[0].id)?.error, 'History unavailable')
+  messenger.loadChatHistory = async () => ({ messages: [message()], nextBefore: null })
+  await store.getState().loadPreviousMessages()
+  assert.equal(store.getState().historyByChat.get(chats[0].id)?.error, null)
+  assert.equal(store.getState().messagesByChat.get(chats[0].id)?.length, 1)
+  store.getState().dispose()
+})
+
+test('history evicts least recently opened chats and reloads them on demand', async () => {
+  const { store, messenger, gateway } = setup()
+  gateway.getChat = async id => ({ ...chats[0], id })
+  messenger.loadChatHistory = async id => ({ messages: [message(id, id)], nextBefore: null })
+  await store.getState().start('alice')
+  for (const id of ['one', 'two', 'three', 'four']) await store.getState().selectChat({ ...chats[0], id })
+  assert.deepEqual([...store.getState().historyByChat.keys()], ['two', 'three', 'four'])
+  assert.equal(store.getState().messagesByChat.has('one'), false)
+  await store.getState().selectChat({ ...chats[0], id: 'one' })
+  assert.equal(store.getState().messagesByChat.has('one'), true)
+  assert.equal(store.getState().messagesByChat.has('two'), false)
+  store.getState().dispose()
+})
+
+
+test('a pending row on a late history page cannot duplicate or regress its accepted live update', async () => {
+  const { store, messenger } = setup()
+  const pending = { ...message('pending:device:client'), status: 'pending' as const }
+  const accepted = { ...pending, messageId: 'server-id', status: 'accepted' as const }
+  let outgoing!: (messages: typeof accepted[]) => void
+  messenger.onOutgoing = handler => { outgoing = handler; return () => {} }
+  const page = deferred<{ messages: typeof pending[]; nextBefore: null }>()
+  messenger.loadChatHistory = async (_id, before) => before ? page.promise : {
+    messages: [message('latest')], nextBefore: { createdAt: timestamp, id: 'cursor' },
+  }
+  await store.getState().start('alice')
+  await store.getState().selectChat(chats[0])
+  const older = store.getState().loadPreviousMessages()
+  outgoing([accepted])
+  page.resolve({ messages: [pending], nextBefore: null })
+  await older
+  const messages = store.getState().messagesByChat.get(chats[0].id)!
+  assert.equal(messages.length, 2)
+  assert.equal(messages.find(item => item.clientMessageId === pending.clientMessageId)?.status, 'accepted')
+  store.getState().dispose()
 })

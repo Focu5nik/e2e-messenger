@@ -2,7 +2,7 @@ import type {
   CurrentUser, DestinationDevice, Device, DirectChat, LoginDevice, MailboxPage,
   SentMessage, User,
 } from '../domain/models.ts'
-import type { MailboxEnvelope, SendMessageRequest } from '../protocol/contracts.ts'
+import type { MailboxEnvelope, MessageEnvelope, SendMessageRequest } from '../protocol/contracts.ts'
 
 // Gateways expose domain values and reject with ClientError for known failures.
 export interface SessionGateway {
@@ -30,12 +30,16 @@ export interface ChatGateway {
 }
 
 export interface MessagingGateway {
+  acknowledgeEnvelope?(envelopeId: string): Promise<MessageEnvelope>
+  findSentMessage?(clientMessageId: string): Promise<SentMessage | null>
   getDestinationDevices(chatId: string): Promise<DestinationDevice[]>
   sendMessage(command: SendMessageRequest): Promise<SentMessage>
   getMailbox(afterSeq: number, limit?: number): Promise<MailboxPage>
 }
 
 export interface RealtimeGateway {
+  acknowledgeEnvelope?(envelopeId: string): Promise<MessageEnvelope>
+  onDelivered?(handler: (envelope: MessageEnvelope) => void): () => void
   readonly ready: boolean
   start(): void
   stop(): void

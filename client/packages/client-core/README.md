@@ -41,15 +41,15 @@ This inventory is checked against TypeScript's resolved entry-point exports by
 | Runtime: preferences | `ChatPreferencesService` |
 | Runtime: stores | `createSessionStore`, `createChatStore` |
 | Runtime: messaging | `MessengerService`, `PlaintextMessageCodec`, `SyncManager`, `mergeMessages` |
-| Types: domain | `User`, `CurrentUser`, `DeviceIdentity`, `LoginDevice`, `Device`, `DirectChat`, `DestinationDevice`, `SentMessage`, `MailboxPage`, `ReceivedMessage`, `DisplayMessage` |
+| Types: domain | `User`, `CurrentUser`, `DeviceIdentity`, `LoginDevice`, `Device`, `DirectChat`, `DestinationDevice`, `SentMessage`, `MailboxPage`, `ReceivedMessage`, `DisplayMessage`, `MessageDeliveryUpdate` |
 | Types: errors | `ClientErrorCode` |
 | Types: HTTP protocol | `CredentialsRequest`, `LoginRequest`, `TokenResponse`, `UserDto`, `CurrentUserDto`, `DeviceDto`, `DirectChatDto`, `DestinationDeviceDto`, `SentMessageDto`, `MailboxPageDto`, `ErrorDetail`, `ErrorResponse` |
 | Types: message / realtime protocol | `ClientEnvelope`, `SendMessageRequest`, `MessageEnvelope`, `MailboxEnvelope`, `ServerEvent`, `ClientEvent` |
 | Types: gateways | `SessionGateway`, `AccountGateway`, `ChatGateway`, `MessagingGateway`, `RealtimeGateway` |
 | Types: platform ports | `DeviceIdentityStore`, `ChatPreferencesStore`, `DeviceDescription`, `IdGenerator`, `TextEncoding` |
-| Types: durable inbox | `DurableDeviceIdentity`, `DurableInbox`, `InboxScope`, `InboxSnapshot`, `OutgoingCommand` |
+| Types: durable inbox | `DurableDeviceIdentity`, `DurableInbox`, `InboxScope`, `InboxSnapshot`, `ChatHistoryCursor`, `ChatHistoryPage`, `OutgoingCommand` |
 | Types: session store | `SessionState`, `SessionStore`, `SessionStoreDependencies` |
-| Types: chat store | `ChatState`, `ChatStore`, `ChatStoreDependencies` |
+| Types: chat store | `ChatHistoryState`, `ChatState`, `ChatStore`, `ChatStoreDependencies` |
 | Types: messaging | `MailboxLoadResult`, `IncomingEnvelope`, `MessageCodec` |
 <!-- public-api:end -->
 

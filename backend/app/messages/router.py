@@ -7,9 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import CurrentPrincipal
 from app.database import get_session
 from app.messages.dependencies import Service
-from app.messages.responses import mailbox_response, message_response
+from app.messages.responses import envelope_response, mailbox_response, message_response
 from app.messages.schemas import (
     DestinationDeviceResponse,
+    EnvelopeResponse,
     MailboxPageResponse,
     MessageResponse,
     SendMessageRequest,
@@ -18,12 +19,40 @@ from app.messages.service import (
     ChatNotFoundError,
     DeliveryTargetsChangedError,
     DuplicateDestinationError,
+    EnvelopeNotFoundError,
     InvalidEnvelopeError,
 )
 
 
 router = APIRouter()
 DatabaseSession: TypeAlias = Annotated[AsyncSession, Depends(get_session)]
+
+
+@router.get("/messages/by-client-id/{client_message_id}", response_model=MessageResponse)
+async def lookup_message(
+    client_message_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: DatabaseSession,
+    service: Service,
+) -> MessageResponse:
+    stored = await service.lookup(session, principal, client_message_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    return message_response(stored)
+
+
+@router.post("/messages/envelopes/{envelope_id}/ack", response_model=EnvelopeResponse)
+async def acknowledge_delivery(
+    envelope_id: uuid.UUID,
+    principal: CurrentPrincipal,
+    session: DatabaseSession,
+    service: Service,
+) -> EnvelopeResponse:
+    try:
+        envelope = await service.acknowledge(session, principal, envelope_id)
+    except EnvelopeNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="envelope not found") from exc
+    return envelope_response(envelope)
 
 
 @router.get(

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
@@ -18,12 +19,13 @@ from app.auth.dependencies import authenticate_access_token
 from app.config import get_settings
 from app.database import get_session
 from app.messages.dependencies import Service
-from app.messages.responses import mailbox_response, message_response
+from app.messages.responses import envelope_response, mailbox_response, message_response
 from app.messages.schemas import SendMessageRequest
 from app.messages.service import (
     ChatNotFoundError,
     DeliveryTargetsChangedError,
     DuplicateDestinationError,
+    EnvelopeNotFoundError,
     InvalidEnvelopeError,
 )
 from app.realtime.events import Connection, ConnectionRegistry
@@ -58,6 +60,18 @@ class SyncEvent(BaseModel):
     type: Literal["sync.request"]
     request_id: str = Field(min_length=1, max_length=128)
     data: SyncRequest
+
+
+class DeliveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    envelope_id: uuid.UUID
+
+
+class DeliveryEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["message.delivered"]
+    request_id: str = Field(min_length=1, max_length=128)
+    data: DeliveryRequest
 
 
 def session_provider(connection: HTTPConnection):
@@ -150,6 +164,27 @@ async def websocket_endpoint(
                     except ValidationError:
                         response = error_event(
                             "invalid_event", "Invalid sync.request data.", 422,
+                            event.get("request_id"),
+                        )
+                elif event.get("type") == "message.delivered":
+                    try:
+                        command = DeliveryEvent.model_validate(event)
+                        envelope = await service.acknowledge(
+                            session, current, command.data.envelope_id
+                        )
+                        response = {
+                            "type": "message.delivered",
+                            "request_id": command.request_id,
+                            "data": envelope_response(envelope).model_dump(mode="json"),
+                        }
+                    except ValidationError:
+                        response = error_event(
+                            "invalid_event", "Invalid message.delivered data.", 422,
+                            event.get("request_id"),
+                        )
+                    except EnvelopeNotFoundError:
+                        response = error_event(
+                            "envelope_not_found", "envelope not found", 404,
                             event.get("request_id"),
                         )
                 elif event.get("type") != "message.send":

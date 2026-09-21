@@ -198,6 +198,8 @@ export function mapServerEvent(value: unknown):
   switch (dto.type) {
     case 'auth.ok': return { type: dto.type }
     case 'message.new': return { type: dto.type, data: mapMailboxEnvelope(dto.data) }
+    case 'message.delivered':
+      return { type: dto.type, request_id: dto.request_id === undefined ? undefined : string(dto.request_id, 'request_id'), data: mapMessageEnvelope(dto.data) }
     case 'message.accepted':
       return { type: dto.type, request_id: string(dto.request_id, 'request_id'), data: mapSentMessage(dto.data) }
     case 'sync.response':
