@@ -1,18 +1,16 @@
-import asyncio
 import base64
 import binascii
 import uuid
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import Principal
 from app.auth.models import Device
-from app.messages.models import Message, MessageEnvelope
+from app.auth.principal import Principal
+from app.messages.models import DeviceMailbox, Message, MessageEnvelope
+from app.messages.notifications import publish_delivery, publish_message
 from app.messages.repository import MessageRepository
-from app.messages.responses import envelope_response, mailbox_envelope_response
 from app.messages.schemas import (
     MAX_ENVELOPE_PAYLOAD_BYTES,
     PLAINTEXT_ENVELOPE_TYPE,
@@ -20,6 +18,7 @@ from app.messages.schemas import (
     ClientEnvelopeRequest,
     SendMessageRequest,
 )
+from app.messages.types import MailboxEntry, MailboxPage, StoredMessage
 from app.realtime.events import EventBus
 
 
@@ -50,25 +49,6 @@ class MailboxInvariantError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True, slots=True)
-class StoredMessage:
-    message: Message
-    envelopes: list[MessageEnvelope]
-
-
-@dataclass(frozen=True, slots=True)
-class MailboxEntry:
-    envelope: MessageEnvelope
-    message: Message
-
-
-@dataclass(frozen=True, slots=True)
-class MailboxPage:
-    entries: list[MailboxEntry]
-    next_seq: int
-    has_more: bool
-
-
 class MessageService:
     def __init__(
         self,
@@ -84,6 +64,7 @@ class MessageService:
         principal: Principal,
         client_message_id: uuid.UUID,
     ) -> StoredMessage | None:
+        """Find an idempotent result, purging and committing expired payloads first."""
         existing = await self.repository.get_message_by_client_id(
             session, principal.device_id, client_message_id
         )
@@ -113,21 +94,7 @@ class MessageService:
             raise EnvelopeNotFoundError
         envelope, sender_device_id = acknowledged
         await session.commit()
-        if self.event_bus is not None:
-            try:
-                await asyncio.wait_for(
-                    self.event_bus.publish(
-                        sender_device_id,
-                        {
-                            "type": "message.delivered",
-                            "data": envelope_response(envelope).model_dump(mode="json"),
-                        },
-                    ),
-                    timeout=5,
-                )
-            except Exception:
-                # Sender recovery reads the retained receipt if the socket fails.
-                pass
+        await publish_delivery(self.event_bus, sender_device_id, envelope)
         return envelope
 
     async def destination_devices(
@@ -159,34 +126,12 @@ class MessageService:
         if other_user_id is None:
             raise ChatNotFoundError
 
-        supplied_by_device: dict[uuid.UUID, ClientEnvelopeRequest] = {}
-        decoded_payloads: dict[uuid.UUID, bytes] = {}
-        for envelope in request.envelopes:
-            if envelope.recipient_device_id in supplied_by_device:
-                raise DuplicateDestinationError
-            decoded_payloads[envelope.recipient_device_id] = self._validate_envelope(
-                envelope
-            )
-            supplied_by_device[envelope.recipient_device_id] = envelope
-
-        # Device creation and revocation take an exclusive lock on this user row.
-        # Holding a shared lock makes the eligible device set stable until commit.
-        if not await self.repository.lock_device_set(session, other_user_id):
-            raise MailboxInvariantError("a chat member has no user")
-
-        eligible_devices = await self.repository.get_active_devices(
-            session, other_user_id
+        supplied_by_device, decoded_payloads = self._validate_envelopes(
+            request.envelopes
         )
-        eligible_ids = {device.id for device in eligible_devices}
-        if set(supplied_by_device) != eligible_ids:
-            raise DeliveryTargetsChangedError
-
-        sorted_device_ids = sorted(eligible_ids, key=lambda item: item.int)
-        mailboxes = await self.repository.lock_mailboxes(
-            session, sorted_device_ids
+        mailboxes = await self._lock_destination_mailboxes(
+            session, other_user_id, set(supplied_by_device)
         )
-        if [mailbox.device_id for mailbox in mailboxes] != sorted_device_ids:
-            raise MailboxInvariantError("an eligible device has no mailbox")
 
         now = datetime.now(UTC)
         message = Message(
@@ -199,22 +144,9 @@ class MessageService:
         )
         session.add(message)
 
-        envelopes: list[MessageEnvelope] = []
-        for mailbox in mailboxes:
-            mailbox.last_seq += 1
-            supplied = supplied_by_device[mailbox.device_id]
-            envelope = MessageEnvelope(
-                id=uuid.uuid4(),
-                message_id=message.id,
-                recipient_device_id=mailbox.device_id,
-                mailbox_seq=mailbox.last_seq,
-                protocol_version=supplied.protocol_version,
-                envelope_type=supplied.envelope_type,
-                payload=decoded_payloads[mailbox.device_id],
-                created_at=now,
-                expires_at=now + PAYLOAD_RETENTION,
-            )
-            envelopes.append(envelope)
+        envelopes = self._create_envelopes(
+            message, mailboxes, supplied_by_device, decoded_payloads
+        )
         session.add_all(envelopes)
 
         try:
@@ -228,29 +160,74 @@ class MessageService:
                 raise
             return StoredMessage(*winning)
         stored = StoredMessage(message=message, envelopes=envelopes)
-        await self._publish(stored)
+        await publish_message(self.event_bus, stored)
         return stored
 
-    async def _publish(self, stored: StoredMessage) -> None:
-        if self.event_bus is None:
-            return
+    @classmethod
+    def _validate_envelopes(
+        cls, envelopes: list[ClientEnvelopeRequest]
+    ) -> tuple[dict[uuid.UUID, ClientEnvelopeRequest], dict[uuid.UUID, bytes]]:
+        supplied_by_device: dict[uuid.UUID, ClientEnvelopeRequest] = {}
+        decoded_payloads: dict[uuid.UUID, bytes] = {}
+        for envelope in envelopes:
+            if envelope.recipient_device_id in supplied_by_device:
+                raise DuplicateDestinationError
+            decoded_payloads[envelope.recipient_device_id] = cls._validate_envelope(
+                envelope
+            )
+            supplied_by_device[envelope.recipient_device_id] = envelope
+        return supplied_by_device, decoded_payloads
 
-        # The database commit is authoritative. A slow or broken socket must not
-        # turn an accepted send into a failed command or delay other recipients.
-        async def publish(envelope: MessageEnvelope) -> None:
-            try:
-                response = mailbox_envelope_response(envelope, stored.message)
-                await asyncio.wait_for(
-                    self.event_bus.publish(
-                        envelope.recipient_device_id,
-                        {"type": "message.new", "data": response.model_dump(mode="json")},
-                    ),
-                    timeout=5,
+    async def _lock_destination_mailboxes(
+        self,
+        session: AsyncSession,
+        other_user_id: uuid.UUID,
+        supplied_device_ids: set[uuid.UUID],
+    ) -> list[DeviceMailbox]:
+        # Device creation and revocation take an exclusive lock on this user row.
+        # Holding a shared lock makes the eligible device set stable until commit.
+        if not await self.repository.lock_device_set(session, other_user_id):
+            raise MailboxInvariantError("a chat member has no user")
+
+        eligible_devices = await self.repository.get_active_devices(
+            session, other_user_id
+        )
+        eligible_ids = {device.id for device in eligible_devices}
+        if supplied_device_ids != eligible_ids:
+            raise DeliveryTargetsChangedError
+
+        sorted_device_ids = sorted(eligible_ids, key=lambda item: item.int)
+        mailboxes = await self.repository.lock_mailboxes(session, sorted_device_ids)
+        if [mailbox.device_id for mailbox in mailboxes] != sorted_device_ids:
+            raise MailboxInvariantError("an eligible device has no mailbox")
+        return mailboxes
+
+    @staticmethod
+    def _create_envelopes(
+        message: Message,
+        mailboxes: list[DeviceMailbox],
+        supplied_by_device: dict[uuid.UUID, ClientEnvelopeRequest],
+        decoded_payloads: dict[uuid.UUID, bytes],
+    ) -> list[MessageEnvelope]:
+        """Allocate sequences on locked mailboxes and build their envelopes."""
+        envelopes: list[MessageEnvelope] = []
+        for mailbox in mailboxes:
+            mailbox.last_seq += 1
+            supplied = supplied_by_device[mailbox.device_id]
+            envelopes.append(
+                MessageEnvelope(
+                    id=uuid.uuid4(),
+                    message_id=message.id,
+                    recipient_device_id=mailbox.device_id,
+                    mailbox_seq=mailbox.last_seq,
+                    protocol_version=supplied.protocol_version,
+                    envelope_type=supplied.envelope_type,
+                    payload=decoded_payloads[mailbox.device_id],
+                    created_at=message.created_at,
+                    expires_at=message.created_at + PAYLOAD_RETENTION,
                 )
-            except Exception:
-                pass
-
-        await asyncio.gather(*(publish(item) for item in stored.envelopes))
+            )
+        return envelopes
 
     @staticmethod
     def _validate_envelope(envelope: ClientEnvelopeRequest) -> bytes:

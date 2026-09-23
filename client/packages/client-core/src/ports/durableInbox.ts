@@ -40,8 +40,6 @@ export interface DurableInbox extends DeviceIdentityStore {
   commitPage(scope: InboxScope, expectedCursor: number, envelopes: MailboxEnvelope[], nextCursor: number): Promise<MailboxEnvelope[]>
   // Replacement is allowed only after an explicit server rejection, in one transaction.
   putOutgoing(scope: InboxScope, command: SendMessageRequest, replaceRejected?: boolean): Promise<OutgoingCommand>
-  // Only an explicit server rejection permits removing/rebuilding a command.
-  rejectOutgoing(scope: InboxScope, clientMessageId: string): Promise<void>
   acceptOutgoing(scope: InboxScope, message: SentMessage): Promise<OutgoingCommand>
   saveChats(scope: InboxScope, chats: DirectChat[]): Promise<void>
 }

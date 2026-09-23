@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     CheckConstraint,
@@ -11,9 +12,12 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+if TYPE_CHECKING:
+    from app.auth.models import User
 
 
 DIRECT_CHAT_TYPE = "DIRECT"
@@ -35,6 +39,12 @@ class Chat(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    members: Mapped[list["ChatMember"]] = relationship(
+        back_populates="chat", lazy="raise", passive_deletes="all"
+    )
+    direct_pair: Mapped["DirectChatPair | None"] = relationship(
+        back_populates="chat", lazy="raise", passive_deletes="all"
+    )
 
 
 class ChatMember(Base):
@@ -50,6 +60,8 @@ class ChatMember(Base):
     joined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    chat: Mapped["Chat"] = relationship(back_populates="members", lazy="raise")
+    user: Mapped["User"] = relationship(lazy="raise")
 
 
 class DirectChatPair(Base):
@@ -81,4 +93,19 @@ class DirectChatPair(Base):
     )
     user_high_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    chat: Mapped["Chat"] = relationship(back_populates="direct_pair", lazy="raise")
+    user_low: Mapped["User"] = relationship(
+        foreign_keys=[user_low_id], lazy="raise"
+    )
+    user_high: Mapped["User"] = relationship(
+        foreign_keys=[user_high_id], lazy="raise"
+    )
+    # Membership associations share columns with chat/user relationships;
+    # keep a single writable owner for each foreign key.
+    low_member: Mapped["ChatMember"] = relationship(
+        foreign_keys=[chat_id, user_low_id], viewonly=True, lazy="raise"
+    )
+    high_member: Mapped["ChatMember"] = relationship(
+        foreign_keys=[chat_id, user_high_id], viewonly=True, lazy="raise"
     )

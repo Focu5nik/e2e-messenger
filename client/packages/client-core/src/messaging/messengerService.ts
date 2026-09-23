@@ -1,7 +1,7 @@
 import { ClientError } from '../domain/errors.ts'
 import type { DirectChat, DisplayMessage, MessageDeliveryUpdate, ReceivedMessage, SentMessage } from '../domain/models.ts'
 import type { ChatHistoryCursor, InboxScope, InboxSnapshot, OutgoingCommand } from '../ports/durableInbox.ts'
-import type { MailboxEnvelope } from '../protocol/contracts.ts'
+import type { MailboxEnvelope, MessageEnvelope, SendMessageRequest } from '../protocol/contracts.ts'
 import type { MessagingGateway, RealtimeGateway } from '../ports/gateways.ts'
 import type { IdGenerator } from '../ports/platform.ts'
 import type { MessageCodec } from './messageCodec.ts'
@@ -92,9 +92,7 @@ export class MessengerService {
           await this.outgoingChanged(outgoing, scope, changes)
         }
         if (scope && this.sync!.scope() !== scope) throw new Error('Message session changed.')
-        const accepted = await (this.realtime?.ready
-          ? this.realtime.sendMessage(command)
-          : this.api.sendMessage(command))
+        const accepted = await this.sendCommand(command)
         if (scope) {
           const outgoing = await this.sync!.inbox.acceptOutgoing(scope, accepted)
           await this.outgoingChanged(outgoing, scope, changes)
@@ -118,38 +116,64 @@ export class MessengerService {
     onError: (error: unknown) => void,
   ): () => void {
     let active = true
-    const unsubscribe = this.realtime?.onMessage((envelope) => {
+
+    const reportError = (error: unknown) => {
+      if (active) onError(error)
+    }
+
+    const handleIncomingEnvelope = async (envelope: MailboxEnvelope): Promise<void> => {
       const scope = this.sync?.scope()
-      const incoming = this.sync
-        ? this.sync.ingest(envelope).then(async (changes) => {
-          if (this.sync!.scope() !== scope) return []
-          const chatIds = [...new Set(changes.envelopes.map(item => item.chat_id))]
-          if (active && chatIds.length) for (const handler of this.activityHandlers) handler(chatIds)
-          const messages = await Promise.all(changes.envelopes.filter(item => !this.historyChats || this.historyChats.has(item.chat_id)).map((item) => this.decodeEnvelope(item)))
-          return messages.filter((message): message is ReceivedMessage => message !== null)
-        })
-        : this.decodeEnvelope(envelope).then((message) => message ? [message] : [])
-      void incoming.then((messages) => {
-        if (active && (!this.sync || this.sync.scope() === scope) && messages.length) onMessage(messages)
-      }).catch((error: unknown) => {
-        if (active) onError(error)
-      })
-    })
-    const unsubscribeDelivered = this.realtime?.onDelivered?.((receipt) => {
+      let messages: ReceivedMessage[]
+
+      if (this.sync) {
+        const changes = await this.sync.ingest(envelope)
+        if (this.sync.scope() !== scope) return
+
+        const chatIds = [...new Set(changes.envelopes.map(item => item.chat_id))]
+        if (active && chatIds.length) {
+          for (const handler of this.activityHandlers) handler(chatIds)
+        }
+
+        const visibleEnvelopes = changes.envelopes.filter(item => !this.historyChats || this.historyChats.has(item.chat_id))
+        const decoded = await Promise.all(visibleEnvelopes.map(item => this.decodeEnvelope(item)))
+        messages = decoded.filter((message): message is ReceivedMessage => message !== null)
+      } else {
+        const message = await this.decodeEnvelope(envelope)
+        messages = message ? [message] : []
+      }
+
+      if (!active || (this.sync && this.sync.scope() !== scope)) return
+      if (messages.length) onMessage(messages)
+    }
+
+    const handleDeliveryReceipt = async (receipt: MessageEnvelope): Promise<void> => {
       if (!this.sync) return
       const scope = this.sync.scope()
-      void this.sync.inbox.applyDeliveryReceipt(scope, receipt).then(outgoing => {
-        if (!active || this.sync!.scope() !== scope || !outgoing?.accepted) return
-        const accepted = outgoing.accepted
-        const update: MessageDeliveryUpdate = {
-          messageId: accepted.id, chatId: accepted.chatId,
-          ...this.deliveryState(accepted),
-        }
-        this.pendingDeliveries.set(update.messageId, { scope, update })
-        this.publishDeliveries()
-      }).catch(error => { if (active) onError(error) })
+      const outgoing = await this.sync.inbox.applyDeliveryReceipt(scope, receipt)
+      if (!active || this.sync.scope() !== scope || !outgoing?.accepted) return
+
+      const accepted = outgoing.accepted
+      const update: MessageDeliveryUpdate = {
+        messageId: accepted.id,
+        chatId: accepted.chatId,
+        ...this.deliveryState(accepted),
+      }
+      this.pendingDeliveries.set(update.messageId, { scope, update })
+      this.publishDeliveries()
+    }
+
+    const unsubscribe = this.realtime?.onMessage(envelope => {
+      void handleIncomingEnvelope(envelope).catch(reportError)
     })
-    return () => { active = false; unsubscribe?.(); unsubscribeDelivered?.() }
+    const unsubscribeDelivered = this.realtime?.onDelivered?.(receipt => {
+      void handleDeliveryReceipt(receipt).catch(reportError)
+    })
+
+    return () => {
+      active = false
+      unsubscribe?.()
+      unsubscribeDelivered?.()
+    }
   }
 
   onReady(handler: () => void): () => void {
@@ -212,12 +236,6 @@ export class MessengerService {
     const decoded = await this.decodeSnapshot({ ...page, chats: [], cursor: 0 }, false)
     if (this.sync.scope() !== scope) throw new Error('Message session changed.')
     return { messages: decoded.messages, nextBefore: page.nextBefore }
-  }
-
-  async restoreLocal(): Promise<MailboxLoadResult & { chats: DirectChat[] }> {
-    if (!this.sync) return { messages: [], envelopes: [], nextSeq: 0, tombstoneCount: 0, chats: [] }
-    const snapshot = await this.sync.snapshot()
-    return { ...await this.decodeSnapshot(snapshot), chats: snapshot.chats }
   }
 
   async cacheChats(chats: DirectChat[]): Promise<void> {
@@ -283,10 +301,16 @@ export class MessengerService {
     try {
       const found = await this.api.findSentMessage(command.client_message_id)
       if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-      // Only an authoritative missing result permits replay, with the exact durable bytes.
-      // A formerly accepted message must never become a new send.
-      const accepted = found ?? (outgoing.accepted ? outgoing.accepted : await (this.realtime?.ready
-        ? this.realtime.sendMessage(command) : this.api.sendMessage(command)))
+      let accepted: SentMessage
+      if (found !== null) {
+        accepted = found
+      } else if (outgoing.accepted) {
+        // A formerly accepted message must never become a new send.
+        accepted = outgoing.accepted
+      } else {
+        // Only an authoritative missing result permits replay, with the exact durable bytes.
+        accepted = await this.sendCommand(command)
+      }
       const updated = await this.sync.inbox.acceptOutgoing(scope, accepted)
       if (JSON.stringify(updated.accepted) !== JSON.stringify(outgoing.accepted)) {
         await this.outgoingChanged(updated, scope, changes)
@@ -304,6 +328,11 @@ export class MessengerService {
       this.inFlight.delete(command.client_message_id)
       this.publishDeliveries()
     }
+  }
+
+  private sendCommand(command: SendMessageRequest): Promise<SentMessage> {
+    if (this.realtime?.ready) return this.realtime.sendMessage(command)
+    return this.api.sendMessage(command)
   }
 
   private async outgoingChanged(outgoing: OutgoingCommand, scope: InboxScope, changes?: Map<string, OutgoingCommand>): Promise<void> {

@@ -75,12 +75,6 @@ export type MailboxEnvelope = MessageEnvelope & {
 
 export type MailboxPageDto = { envelopes: MailboxEnvelope[]; next_seq: number; has_more: boolean }
 
-export type ErrorDetail =
-  | string
-  | Array<{ loc?: Array<string | number>; msg?: string; type?: string }>
-  | { code?: string; message?: string }
-export type ErrorResponse = { detail?: ErrorDetail }
-
 export type ServerEvent =
   | { type: 'message.delivered'; request_id?: string; data: MessageEnvelope }
   | { type: 'auth.ok' }

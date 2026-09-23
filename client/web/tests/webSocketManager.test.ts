@@ -323,3 +323,45 @@ test('V6 interrupted ACKs reject and release pending timers for durable retry', 
     assert.equal(timers.size, 0)
   }
 })
+
+test('outgoing request failures preserve operation errors and release timers', async () => {
+  const operations = [
+    {
+      request: (manager: WebSocketManager) => manager.acknowledgeEnvelope('envelope'),
+      timeout: 'Delivery acknowledgment timed out.',
+      lost: 'Connection lost during delivery acknowledgment.',
+      code: 'network_error',
+    },
+    {
+      request: (manager: WebSocketManager) => manager.sendMessage(command),
+      timeout: 'Message confirmation timed out. Delivery is unconfirmed.',
+      lost: 'Connection lost. Message delivery is unconfirmed.',
+      code: 'delivery_unconfirmed',
+    },
+    {
+      request: (manager: WebSocketManager) => manager.getMailbox(0),
+      timeout: 'Mailbox sync timed out. Reconnect to try again.',
+      lost: 'Connection lost during mailbox sync.',
+      code: 'network_error',
+    },
+  ]
+  for (const operation of operations) {
+    for (const failure of ['timeout', 'send', 'disconnect'] as const) {
+      const { manager, sockets, timers, runTimer } = setup()
+      manager.start()
+      await Promise.resolve()
+      const socket = sockets[0]
+      socket.open()
+      socket.receive({ type: 'auth.ok' })
+      if (failure === 'send') socket.send = () => { throw new Error('Socket closed') }
+      const response = operation.request(manager)
+      if (failure === 'timeout') runTimer(15_000)
+      if (failure === 'disconnect') manager.stop()
+      await assert.rejects(response, (error: unknown) => error instanceof ApiError
+        && error.message === (failure === 'timeout' ? operation.timeout : operation.lost)
+        && error.code === operation.code)
+      assert.equal(timers.size, 0)
+      manager.stop()
+    }
+  }
+})

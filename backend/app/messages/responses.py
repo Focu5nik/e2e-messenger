@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
 
 from app.messages.models import Message, MessageEnvelope
 from app.messages.schemas import (
@@ -11,8 +10,7 @@ from app.messages.schemas import (
     MessageResponse,
 )
 
-if TYPE_CHECKING:
-    from app.messages.service import MailboxPage, StoredMessage
+from app.messages.types import MailboxPage, StoredMessage
 
 
 def utc(value: datetime) -> datetime:

@@ -178,7 +178,7 @@ class ChatService:
         )
         return (
             select(Chat, other_user)
-            .join(DirectChatPair, DirectChatPair.chat_id == Chat.id)
+            .join(Chat.direct_pair)
             .join(other_user, other_user.id == other_user_id)
             .where(
                 Chat.type == "DIRECT",

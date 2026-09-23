@@ -1,8 +1,7 @@
 import asyncio
 import json
-import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import (
     APIRouter,
@@ -10,68 +9,22 @@ from fastapi import (
     HTTPException,
     WebSocket,
     WebSocketDisconnect,
-    status,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import ValidationError
 from starlette.requests import HTTPConnection
 
 from app.auth.dependencies import authenticate_access_token
 from app.config import get_settings
 from app.database import get_session
 from app.messages.dependencies import Service
-from app.messages.responses import envelope_response, mailbox_response, message_response
-from app.messages.schemas import SendMessageRequest
-from app.messages.service import (
-    ChatNotFoundError,
-    DeliveryTargetsChangedError,
-    DuplicateDestinationError,
-    EnvelopeNotFoundError,
-    InvalidEnvelopeError,
-)
 from app.realtime.events import Connection, ConnectionRegistry
+from app.realtime.handlers import error_event, handle_command
+from app.realtime.schemas import AuthEvent
 
 
 router = APIRouter()
 AUTH_TIMEOUT_SECONDS = 10
 AUTH_CHECK_INTERVAL_SECONDS = 30
-
-
-class AuthEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["auth"]
-    access_token: str = Field(min_length=1, max_length=8192)
-
-
-class SendEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["message.send"]
-    request_id: str = Field(min_length=1, max_length=128)
-    data: SendMessageRequest
-
-
-class SyncRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    after_seq: int = Field(default=0, ge=0, le=2**63 - 1)
-    limit: int = Field(default=100, ge=1, le=100)
-
-
-class SyncEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["sync.request"]
-    request_id: str = Field(min_length=1, max_length=128)
-    data: SyncRequest
-
-
-class DeliveryRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    envelope_id: uuid.UUID
-
-
-class DeliveryEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["message.delivered"]
-    request_id: str = Field(min_length=1, max_length=128)
-    data: DeliveryRequest
 
 
 def session_provider(connection: HTTPConnection):
@@ -91,13 +44,6 @@ async def receive_event(websocket: WebSocket) -> dict:
     event = json.loads(raw)
     if not isinstance(event, dict):
         raise ValueError("invalid event")
-    return event
-
-
-def error_event(code: str, message: str, status: int, request_id=None) -> dict:
-    event = {"type": "error", "error": {"code": code, "message": message, "status": status}}
-    if isinstance(request_id, str) and 0 < len(request_id) <= 128:
-        event["request_id"] = request_id
     return event
 
 
@@ -151,84 +97,7 @@ async def websocket_endpoint(
             # a current session; they cannot keep a revoked connection alive.
             async with sessions() as session:
                 current = await authenticate_access_token(auth.access_token, session)
-                if event.get("type") == "sync.request":
-                    try:
-                        command = SyncEvent.model_validate(event)
-                        page = await service.mailbox(
-                            session, current, command.data.after_seq, command.data.limit
-                        )
-                        response = {
-                            "type": "sync.response", "request_id": command.request_id,
-                            "data": mailbox_response(page).model_dump(mode="json"),
-                        }
-                    except ValidationError:
-                        response = error_event(
-                            "invalid_event", "Invalid sync.request data.", 422,
-                            event.get("request_id"),
-                        )
-                elif event.get("type") == "message.delivered":
-                    try:
-                        command = DeliveryEvent.model_validate(event)
-                        envelope = await service.acknowledge(
-                            session, current, command.data.envelope_id
-                        )
-                        response = {
-                            "type": "message.delivered",
-                            "request_id": command.request_id,
-                            "data": envelope_response(envelope).model_dump(mode="json"),
-                        }
-                    except ValidationError:
-                        response = error_event(
-                            "invalid_event", "Invalid message.delivered data.", 422,
-                            event.get("request_id"),
-                        )
-                    except EnvelopeNotFoundError:
-                        response = error_event(
-                            "envelope_not_found", "envelope not found", 404,
-                            event.get("request_id"),
-                        )
-                elif event.get("type") != "message.send":
-                    response = error_event(
-                        "unsupported_event", "Event is not supported in this version.",
-                        400, event.get("request_id"),
-                    )
-                else:
-                    try:
-                        command = SendEvent.model_validate(event)
-                        stored = await service.send(session, current, command.data)
-                        accepted = message_response(stored)
-                        response = {
-                            "type": "message.accepted", "request_id": command.request_id,
-                            "data": accepted.model_dump(mode="json"),
-                        }
-                    except ValidationError:
-                        response = error_event(
-                            "invalid_event", "Invalid message.send data.", 422,
-                            event.get("request_id"),
-                        )
-                    except ChatNotFoundError:
-                        response = error_event(
-                            "message_rejected", "chat not found",
-                            status.HTTP_404_NOT_FOUND, event.get("request_id"),
-                        )
-                    except DuplicateDestinationError:
-                        response = error_event(
-                            "message_rejected", "duplicate recipient device",
-                            status.HTTP_422_UNPROCESSABLE_CONTENT,
-                            event.get("request_id"),
-                        )
-                    except InvalidEnvelopeError as exc:
-                        response = error_event(
-                            "message_rejected", str(exc),
-                            status.HTTP_422_UNPROCESSABLE_CONTENT,
-                            event.get("request_id"),
-                        )
-                    except DeliveryTargetsChangedError:
-                        response = error_event(
-                            "delivery_targets_changed",
-                            "Destination devices changed; refresh and retry.",
-                            status.HTTP_409_CONFLICT, event.get("request_id"),
-                        )
+                response = await handle_command(event, session, current, service)
             await connection.send(response)
     except HTTPException:
         if connection is not None:

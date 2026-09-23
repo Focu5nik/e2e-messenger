@@ -18,6 +18,23 @@ function equalMessages(a: DisplayMessage, b: DisplayMessage): boolean {
   })
 }
 
+function selectStatus(previous: DisplayMessage['status'], incoming: DisplayMessage['status']): DisplayMessage['status'] {
+  if (!incoming) return previous
+  if (previous && rank[previous] > rank[incoming]) return previous
+  return incoming
+}
+
+function compareMessages(a: DisplayMessage, b: DisplayMessage): number {
+  if (a.createdAt < b.createdAt) return -1
+  if (a.createdAt > b.createdAt) return 1
+
+  const aKey = a.historyId ?? commandKey(a) ?? a.messageId
+  const bKey = b.historyId ?? commandKey(b) ?? b.messageId
+  if (aKey < bKey) return -1
+  if (aKey > bKey) return 1
+  return 0
+}
+
 export function mergeMessages(current: DisplayMessage[], incoming: DisplayMessage[]): DisplayMessage[] {
   if (!incoming.length) return current
   const messages = new Map(current.map((message) => [message.messageId, message]))
@@ -30,11 +47,15 @@ export function mergeMessages(current: DisplayMessage[], incoming: DisplayMessag
   for (const message of incoming) {
     const key = commandKey(message)
     const command = key ? commands.get(key) : undefined
-    const prior = messages.get(message.messageId)
-      ?? (command?.status === 'pending' || message.status === 'pending' ? command : undefined)
+    let prior = messages.get(message.messageId)
+    if (!prior && (command?.status === 'pending' || message.status === 'pending')) {
+      prior = command
+    }
     if (prior?.status && prior.status !== 'pending' && message.status === 'pending') continue
-    const status = prior?.status && message.status && rank[prior.status] > rank[message.status] ? prior.status : message.status ?? prior?.status
-    const next = { ...prior, ...message, ...(prior ? { createdAt: prior.createdAt } : {}), ...(status ? { status } : {}) }
+    const status = selectStatus(prior?.status, message.status)
+    const next = { ...prior, ...message }
+    if (prior) next.createdAt = prior.createdAt
+    if (status) next.status = status
     if (prior && equalMessages(prior, next)) continue
     if (prior) {
       messages.delete(prior.messageId)
@@ -45,11 +66,8 @@ export function mergeMessages(current: DisplayMessage[], incoming: DisplayMessag
     if (key) commands.set(key, next)
     changed = true
   }
-  return changed ? [...messages.values()].sort((a, b) => {
-    const aKey = a.historyId ?? commandKey(a) ?? a.messageId
-    const bKey = b.historyId ?? commandKey(b) ?? b.messageId
-    return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : aKey < bKey ? -1 : aKey > bKey ? 1 : 0
-  }) : current
+  if (!changed) return current
+  return [...messages.values()].sort(compareMessages)
 }
 
 // Clone and merge only affected conversations; other chat selectors stay stable.

@@ -27,7 +27,13 @@ function setup() {
     async readCursor() { return state.cursor },
     async getPendingAcknowledgments() { return structuredClone(state.envelopes.filter(item => item.payload !== null && !item.delivered_at)) },
     async getOutgoingToRecover() { return structuredClone(state.outgoing.filter(item => !item.accepted?.envelopes.length || item.accepted.envelopes.some(envelope => !envelope.delivered_at))) },
-    async readChatHistory() { throw new Error('Not used') },
+    async readChatHistory(_scope, chatId, limit, before) {
+      const envelopes = state.envelopes.filter(item => item.chat_id === chatId)
+      const outgoing = state.outgoing.filter(item => item.command.chat_id === chatId)
+      assert.equal(before, undefined)
+      assert.ok(envelopes.length + outgoing.length <= limit, 'Fixture history fits in one page')
+      return structuredClone({ envelopes, outgoing, nextBefore: null })
+    },
     async applyDeliveryReceipt(_scope, receipt) {
       const outgoing = state.outgoing.find(item => item.accepted?.id === receipt.message_id)
       if (!outgoing?.accepted) { receipts.set(receipt.id, receipt as MailboxEnvelope); return null }
@@ -62,7 +68,6 @@ function setup() {
       } else state.outgoing.push({ command: structuredClone(command), accepted: null })
       return structuredClone(state.outgoing.find(item => item.command.client_message_id === command.client_message_id)!)
     },
-    async rejectOutgoing(_scope, id) { state.outgoing = state.outgoing.filter(item => item.command.client_message_id !== id) },
     async acceptOutgoing(_scope, accepted) {
       const outgoing = state.outgoing.find(item => item.command.client_message_id === accepted.clientMessageId)!
       outgoing.accepted = structuredClone(accepted)
@@ -104,7 +109,7 @@ test('offline 5 then 3 pages resume only from durable cursor and reload without 
   assert.equal((await restored.synchronize()).envelopes.length, 3)
   assert.deepEqual(requested, [0, 3, 5])
   await restored.ingest(envelope(8))
-  assert.equal((await restored.snapshot()).envelopes.length, 8)
+  assert.equal((await restored.inbox.snapshot(restored.scope())).envelopes.length, 8)
 })
 
 test('tombstones retain complete metadata and advance the atomic page cursor', async () => {
@@ -124,7 +129,7 @@ test('failed local commit leaves cursor unchanged and the next sync retries the 
   const commit = inbox.commitPage
   inbox.commitPage = async () => { throw new Error('Transaction aborted') }
   await assert.rejects(manager.synchronize(), /aborted/)
-  assert.equal((await manager.snapshot()).cursor, 0)
+  assert.equal((await manager.inbox.snapshot(manager.scope())).cursor, 0)
   inbox.commitPage = commit
   assert.equal((await manager.synchronize()).cursor, 1)
   assert.deepEqual(requested, [0, 0])
@@ -193,7 +198,7 @@ test('outgoing commands commit before send, accepted messages restore, and faile
   await manager.activate(user)
   const send = api.sendMessage
   api.sendMessage = async command => {
-    assert.deepEqual((await manager.snapshot()).outgoing[0].command, command)
+    assert.deepEqual((await manager.inbox.snapshot(manager.scope())).outgoing[0].command, command)
     return send(command)
   }
   const codec = {
@@ -202,8 +207,8 @@ test('outgoing commands commit before send, accepted messages restore, and faile
   }
   const messenger = new MessengerService(api, codec, () => 'client-id', undefined, manager)
   await messenger.sendText('chat', 'private content')
-  assert.equal((await messenger.restoreLocal()).messages[0].content, 'decoded only in memory')
-  assert.doesNotMatch(JSON.stringify(await manager.snapshot()), /private content|decoded only/)
+  assert.equal((await messenger.loadChatHistory('chat')).messages[0].content, 'decoded only in memory')
+  assert.doesNotMatch(JSON.stringify(await manager.inbox.snapshot(manager.scope())), /private content|decoded only/)
   inbox.putOutgoing = async () => { throw new Error('Quota exceeded') }
   api.sendMessage = async () => { throw new Error('Unexpected transmission') }
   await assert.rejects(messenger.sendText('chat', 'next'), /Quota/)
@@ -236,7 +241,7 @@ test('V6 ACK waits for durable commit and retries after crash without losing the
     let loseResponse = true
     api.acknowledgeEnvelope = async id => {
       acknowledgments += 1
-      const state = await manager.snapshot()
+      const state = await manager.inbox.snapshot(manager.scope())
       assert.equal(state.cursor, 1)
       assert.equal(state.envelopes[0].id, id)
       assert.equal(state.envelopes[0].payload, 'opaque')
@@ -251,7 +256,7 @@ test('V6 ACK waits for durable commit and retries after crash without losing the
     inbox.commitPage = commit
     assert.equal((await deliver()).envelopes.length, 1)
     assert.equal(acknowledgments, 1)
-    assert.equal((await manager.snapshot()).cursor, 1)
+    assert.equal((await manager.inbox.snapshot(manager.scope())).cursor, 1)
     // Simulated restart cannot rely on the cursor alone: the pending ACK is local.
     const restarted = new SyncManager(inbox, api)
     await restarted.activate(user)
@@ -292,12 +297,12 @@ test('V6 recovery looks up the original ID and only resends exact durable bytes 
       async buildOutgoing() { throw new Error('Recovery must not re-encode') },
       async decodeIncoming() { return 'decoded in memory' },
     }, () => { throw new Error('Recovery must not generate an ID') }, undefined, manager)
-    assert.equal((await messenger.restoreLocal()).messages[0].status, 'pending')
+    assert.equal((await messenger.loadChatHistory('chat')).messages[0].status, 'pending')
     await messenger.sendText('chat', 'must not rebuild this text', 'original-id')
     assert.equal(sends, committed ? 0 : 1)
-    assert.equal((await manager.snapshot()).outgoing.length, 1)
-    assert.deepEqual((await manager.snapshot()).outgoing[0].command, command)
-    assert.equal((await messenger.restoreLocal()).messages[0].status, 'accepted')
+    assert.equal((await manager.inbox.snapshot(manager.scope())).outgoing.length, 1)
+    assert.deepEqual((await manager.inbox.snapshot(manager.scope())).outgoing[0].command, command)
+    assert.equal((await messenger.loadChatHistory('chat')).messages[0].status, 'accepted')
   }
 })
 
@@ -313,7 +318,7 @@ test('V6 recovery never sends when the acceptance lookup itself is ambiguous', a
     async buildOutgoing() { throw new Error('Unexpected re-encoding') }, async decodeIncoming() { return 'private' },
   }, () => 'new-id', undefined, manager)
   await assert.rejects(messenger.retryOutgoing('original'), /Lookup disconnected/)
-  assert.equal((await manager.snapshot()).outgoing[0].accepted, null)
+  assert.equal((await manager.inbox.snapshot(manager.scope())).outgoing[0].accepted, null)
 })
 
 test('V6 outgoing pending state is emitted before transmission and converges through delivery receipt', async () => {
@@ -341,7 +346,7 @@ test('V6 outgoing pending state is emitted before transmission and converges thr
   receiptHandler!({ ...destination, payload: null, delivered_at: user.createdAt, payload_purged_at: user.createdAt })
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(states, ['pending', 'accepted', 'delivered'])
-  assert.equal((await manager.snapshot()).outgoing.length, 1)
+  assert.equal((await manager.inbox.snapshot(manager.scope())).outgoing.length, 1)
   unsubscribe()
 })
 
@@ -376,7 +381,7 @@ test('V6 receipt arriving during the acceptance transaction converges without re
   messenger.subscribe(() => {}, error => { throw error })
   await messenger.sendText('chat', 'private')
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal((await messenger.restoreLocal()).messages[0].status, 'delivered')
+  assert.equal((await messenger.loadChatHistory('chat')).messages[0].status, 'delivered')
 })
 
 test('V6 retry cannot replay an old snapshot under a replaced session', async () => {
@@ -411,9 +416,9 @@ test('V6 explicit target rejection retains a durable pending record if fresh tar
     async decodeIncoming() { return 'private' },
   }, () => 'rejected-id', undefined, manager)
   await assert.rejects(messenger.sendText('chat', 'private'), /no available devices/)
-  assert.equal((await manager.snapshot()).outgoing.length, 1)
-  assert.equal((await manager.snapshot()).outgoing[0].command.client_message_id, 'rejected-id')
-  assert.equal((await messenger.restoreLocal()).messages[0].status, 'pending')
+  assert.equal((await manager.inbox.snapshot(manager.scope())).outgoing.length, 1)
+  assert.equal((await manager.inbox.snapshot(manager.scope())).outgoing[0].command.client_message_id, 'rejected-id')
+  assert.equal((await messenger.loadChatHistory('chat')).messages[0].status, 'pending')
 })
 
 test('V6 one failed outgoing recovery does not hide the inbox or block other accepted commands', async () => {
@@ -433,7 +438,7 @@ test('V6 one failed outgoing recovery does not hide the inbox or block other acc
   }, () => 'unused', undefined, manager)
   const loaded = await messenger.loadMailbox()
   assert.equal(loaded.messages.length, 1)
-  const restored = await messenger.restoreLocal()
+  const restored = await messenger.loadChatHistory('chat')
   assert.equal(restored.messages.find(item => item.clientMessageId === 'failed')?.status, 'pending')
   assert.equal(restored.messages.find(item => item.clientMessageId === 'confirmed')?.status, 'accepted')
 })

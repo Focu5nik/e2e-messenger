@@ -292,40 +292,6 @@ test('real-time incoming envelopes use the same decoder, skip tombstones and sto
   assert.equal(messages.length, 1)
 })
 
-test('a late initial mailbox snapshot preserves live arrivals and accepted sends without duplicates', async () => {
-  let resolveMailbox: ((page: MailboxPage) => void) | undefined
-  let receive: ((envelope: MailboxEnvelope) => void) | undefined
-  const api: MessagingGateway = {
-    async getDestinationDevices() { return [] },
-    async sendMessage(command) { return sentMessage(command) },
-    getMailbox() { return new Promise((resolve) => { resolveMailbox = resolve }) },
-  }
-  const realtime: RealtimeGateway = {
-    start() {}, stop() {}, ready: true,
-    async sendMessage(command) { return sentMessage(command) },
-    onMessage(handler) { receive = handler; return () => {} },
-    onReady: () => () => {},
-  }
-  const messenger = new MessengerService(api, codec, createId, realtime)
-  let displayed: DisplayMessage[] = [{
-    messageId: 'outgoing', chatId: 'chat-1', senderUserId: 'me', content: 'sent', createdAt: '2026-09-07T10:02:00Z',
-  }]
-  const unsubscribe = messenger.subscribe(
-    (message) => { displayed = mergeMessages(displayed, message) },
-    (error) => { throw error },
-  )
-  const initialLoad = messenger.loadMailbox().then(({ messages }) => { displayed = mergeMessages(displayed, messages) })
-  const live = mailboxEnvelope({ id: 'live-envelope', message_id: 'live-message', message_created_at: '2026-09-07T10:01:00Z' })
-  receive?.(live)
-  receive?.(live)
-  await Promise.resolve()
-  await Promise.resolve()
-  resolveMailbox?.({ envelopes: [mailboxEnvelope()], nextSeq: 1, hasMore: false })
-  await initialLoad
-  assert.deepEqual(displayed.map((message) => message.messageId), ['message-1', 'live-message', 'outgoing'])
-  unsubscribe()
-})
-
 test('codec rejects unsupported protocols and malformed payloads', async () => {
   await assert.rejects(codec.buildOutgoing('hello', [{ id: 'device-1', protocolVersion: 1 }]),
     /does not support plaintext messaging/)

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import CurrentPrincipal
 from app.database import get_session
 from app.messages.dependencies import Service
+from app.messages.error_responses import MessageErrorDescription, describe_message_error
 from app.messages.responses import envelope_response, mailbox_response, message_response
 from app.messages.schemas import (
     DestinationDeviceResponse,
@@ -26,6 +27,15 @@ from app.messages.service import (
 
 router = APIRouter()
 DatabaseSession: TypeAlias = Annotated[AsyncSession, Depends(get_session)]
+
+
+def message_http_error(description: MessageErrorDescription) -> HTTPException:
+    detail = (
+        {"code": description.code, "message": description.message}
+        if description.code == "delivery_targets_changed"
+        else description.message
+    )
+    return HTTPException(status_code=description.status, detail=detail)
 
 
 @router.get("/messages/by-client-id/{client_message_id}", response_model=MessageResponse)
@@ -51,7 +61,7 @@ async def acknowledge_delivery(
     try:
         envelope = await service.acknowledge(session, principal, envelope_id)
     except EnvelopeNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="envelope not found") from exc
+        raise message_http_error(describe_message_error(exc)) from exc
     return envelope_response(envelope)
 
 
@@ -68,9 +78,7 @@ async def destination_devices(
     try:
         devices = await service.destination_devices(session, principal, chat_id)
     except ChatNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="chat not found"
-        ) from exc
+        raise message_http_error(describe_message_error(exc)) from exc
     return [
         DestinationDeviceResponse(
             id=device.id, protocol_version=device.protocol_version
@@ -92,28 +100,13 @@ async def send_message(
 ) -> MessageResponse:
     try:
         stored = await service.send(session, principal, request)
-    except ChatNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="chat not found"
-        ) from exc
-    except DuplicateDestinationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="duplicate recipient device",
-        ) from exc
-    except InvalidEnvelopeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=str(exc),
-        ) from exc
-    except DeliveryTargetsChangedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "delivery_targets_changed",
-                "message": "Destination devices changed; refresh and retry.",
-            },
-        ) from exc
+    except (
+        ChatNotFoundError,
+        DuplicateDestinationError,
+        InvalidEnvelopeError,
+        DeliveryTargetsChangedError,
+    ) as exc:
+        raise message_http_error(describe_message_error(exc)) from exc
     return message_response(stored)
 
 

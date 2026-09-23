@@ -8,13 +8,11 @@ export interface SocketAuth {
   onSessionCleared(handler: () => void): () => void
 }
 
-type PendingSend = {
-  resolve: (message: SentMessage) => void
+type PendingRequest<T> = {
+  resolve: (data: T) => void
   reject: (error: Error) => void
   timer: number
 }
-type PendingAck = { resolve: (envelope: MessageEnvelope) => void; reject: (error: Error) => void; timer: number }
-type PendingSync = { resolve: (page: MailboxPage) => void; reject: (error: Error) => void; timer: number }
 
 export class WebSocketManager implements RealtimeGateway {
   private readonly auth: SocketAuth
@@ -29,10 +27,10 @@ export class WebSocketManager implements RealtimeGateway {
   private unsubscribeSession: (() => void) | null = null
   private messageHandlers = new Set<(envelope: MailboxEnvelope) => void>()
   private deliveredHandlers = new Set<(envelope: MessageEnvelope) => void>()
-  private pendingAck = new Map<string, PendingAck>()
+  private pendingAck = new Map<string, PendingRequest<MessageEnvelope>>()
   private readyHandlers = new Set<() => void>()
-  private pending = new Map<string, PendingSend>()
-  private pendingSync = new Map<string, PendingSync>()
+  private pending = new Map<string, PendingRequest<SentMessage>>()
+  private pendingSync = new Map<string, PendingRequest<MailboxPage>>()
 
   constructor(auth: SocketAuth, createSocket = (url: string) => new WebSocket(url)) {
     this.auth = auth
@@ -82,58 +80,49 @@ export class WebSocketManager implements RealtimeGateway {
   }
 
   acknowledgeEnvelope(envelopeId: string): Promise<MessageEnvelope> {
-    if (!this.ready) return Promise.reject(new ApiError('Real-time connection is unavailable.', 0))
-    const requestId = crypto.randomUUID()
-    return new Promise((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        this.pendingAck.delete(requestId)
-        reject(new ApiError('Delivery acknowledgment timed out.', 0))
-      }, 15_000)
-      this.pendingAck.set(requestId, { resolve, reject, timer })
-      try {
-        this.socket!.send(JSON.stringify({ type: 'message.delivered', request_id: requestId, data: { envelope_id: envelopeId } } satisfies ClientEvent))
-      } catch {
-        window.clearTimeout(timer)
-        this.pendingAck.delete(requestId)
-        reject(new ApiError('Connection lost during delivery acknowledgment.', 0))
-      }
-    })
+    return this.request(
+      this.pendingAck,
+      requestId => ({ type: 'message.delivered', request_id: requestId, data: { envelope_id: envelopeId } }),
+      () => new ApiError('Delivery acknowledgment timed out.', 0),
+      () => new ApiError('Connection lost during delivery acknowledgment.', 0),
+    )
   }
 
   sendMessage(command: SendMessageRequest): Promise<SentMessage> {
-    if (!this.ready) return Promise.reject(new ApiError('Real-time connection is unavailable.', 0))
-    const requestId = crypto.randomUUID()
-    return new Promise((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        this.pending.delete(requestId)
-        reject(new ApiError('Message confirmation timed out. Delivery is unconfirmed.', 0, null, 'delivery_unconfirmed'))
-      }, 15_000)
-      this.pending.set(requestId, { resolve, reject, timer })
-      try {
-        this.socket!.send(JSON.stringify({ type: 'message.send', request_id: requestId, data: command } satisfies ClientEvent))
-      } catch {
-        window.clearTimeout(timer)
-        this.pending.delete(requestId)
-        reject(new ApiError('Connection lost. Message delivery is unconfirmed.', 0, null, 'delivery_unconfirmed'))
-      }
-    })
+    return this.request(
+      this.pending,
+      requestId => ({ type: 'message.send', request_id: requestId, data: command }),
+      () => new ApiError('Message confirmation timed out. Delivery is unconfirmed.', 0, null, 'delivery_unconfirmed'),
+      () => new ApiError('Connection lost. Message delivery is unconfirmed.', 0, null, 'delivery_unconfirmed'),
+    )
   }
 
   getMailbox(afterSeq: number, limit = 100): Promise<MailboxPage> {
+    return this.request(
+      this.pendingSync,
+      requestId => ({ type: 'sync.request', request_id: requestId, data: { after_seq: afterSeq, limit } }),
+      () => new ApiError('Mailbox sync timed out. Reconnect to try again.', 0),
+      () => new ApiError('Connection lost during mailbox sync.', 0),
+    )
+  }
+
+  private request<T>(
+    requests: Map<string, PendingRequest<T>>,
+    createEvent: (requestId: string) => ClientEvent,
+    timeoutError: () => ApiError,
+    connectionLostError: () => ApiError,
+  ): Promise<T> {
     if (!this.ready) return Promise.reject(new ApiError('Real-time connection is unavailable.', 0))
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
-        this.pendingSync.delete(requestId)
-        reject(new ApiError('Mailbox sync timed out. Reconnect to try again.', 0))
+        this.takePending(requests, requestId)?.reject(timeoutError())
       }, 15_000)
-      this.pendingSync.set(requestId, { resolve, reject, timer })
+      requests.set(requestId, { resolve, reject, timer })
       try {
-        this.socket!.send(JSON.stringify({ type: 'sync.request', request_id: requestId, data: { after_seq: afterSeq, limit } } satisfies ClientEvent))
+        this.socket!.send(JSON.stringify(createEvent(requestId)))
       } catch {
-        window.clearTimeout(timer)
-        this.pendingSync.delete(requestId)
-        reject(new ApiError('Connection lost during mailbox sync.', 0))
+        this.takePending(requests, requestId)?.reject(connectionLostError())
       }
     })
   }
@@ -155,42 +144,12 @@ export class WebSocketManager implements RealtimeGateway {
       socket.onmessage = (event) => {
         if (!current() || typeof event.data !== 'string') return
         let frame: ReturnType<typeof mapServerEvent>
-        try { frame = mapServerEvent(JSON.parse(event.data)) } catch { return }
-        if (!frame || typeof frame !== 'object') return
-        if (frame.type === 'auth.ok') {
-          if (this.authenticated) return
-          this.clearAuthTimer()
-          this.authenticated = true
-          this.retries = 0
-          for (const handler of this.readyHandlers) handler()
-        } else if (this.authenticated && frame.type === 'message.new' && frame.data) {
-          for (const handler of this.messageHandlers) handler(frame.data)
-        } else if (this.authenticated && (frame.type === 'message.delivered' || frame.type === 'error')
-          && frame.request_id && this.pendingAck.has(frame.request_id)) {
-          const pending = this.pendingAck.get(frame.request_id)!
-          this.pendingAck.delete(frame.request_id)
-          window.clearTimeout(pending.timer)
-          if (frame.type === 'message.delivered') pending.resolve(frame.data)
-          else pending.reject(new ApiError(frame.error.message, frame.error.status, frame.error.code))
-        } else if (this.authenticated && frame.type === 'message.delivered' && !frame.request_id) {
-          for (const handler of this.deliveredHandlers) handler(frame.data)
-        } else if (this.authenticated && (frame.type === 'sync.response' || frame.type === 'error')
-          && frame.request_id && this.pendingSync.has(frame.request_id)) {
-          const pending = this.pendingSync.get(frame.request_id)!
-          this.pendingSync.delete(frame.request_id)
-          window.clearTimeout(pending.timer)
-          if (frame.type === 'sync.response') pending.resolve(frame.data)
-          else pending.reject(new ApiError(frame.error.message, frame.error.status, frame.error.code))
-        } else if (this.authenticated && (frame.type === 'message.accepted' || frame.type === 'error')) {
-          const requestId = frame.request_id
-          const pending = requestId ? this.pending.get(requestId) : undefined
-          if (!pending || !requestId) return
-          if (frame.type === 'error' && !frame.error) return
-          this.pending.delete(requestId)
-          window.clearTimeout(pending.timer)
-          if (frame.type === 'message.accepted') pending.resolve(frame.data)
-          else pending.reject(new ApiError(frame.error.message, frame.error.status, frame.error.code))
+        try {
+          frame = mapServerEvent(JSON.parse(event.data))
+        } catch {
+          return
         }
+        this.handleFrame(frame)
       }
       socket.onerror = () => {
         // Browsers follow connection errors with close; reconnect is scheduled there.
@@ -209,6 +168,60 @@ export class WebSocketManager implements RealtimeGateway {
       if (error instanceof ApiError && error.status >= 400 && error.status < 500) this.stop()
       else this.scheduleReconnect(refresh)
     }
+  }
+
+  private handleFrame(frame: ReturnType<typeof mapServerEvent>): void {
+    if (frame.type === 'auth.ok') {
+      if (this.authenticated) return
+      this.clearAuthTimer()
+      this.authenticated = true
+      this.retries = 0
+      for (const handler of this.readyHandlers) handler()
+      return
+    }
+
+    if (!this.authenticated) return
+
+    switch (frame.type) {
+      case 'message.new':
+        for (const handler of this.messageHandlers) handler(frame.data)
+        return
+
+      case 'message.delivered':
+        if (frame.request_id) {
+          this.takePending(this.pendingAck, frame.request_id)?.resolve(frame.data)
+        } else {
+          for (const handler of this.deliveredHandlers) handler(frame.data)
+        }
+        return
+
+      case 'sync.response':
+        this.takePending(this.pendingSync, frame.request_id)?.resolve(frame.data)
+        return
+
+      case 'message.accepted':
+        this.takePending(this.pending, frame.request_id)?.resolve(frame.data)
+        return
+
+      case 'error': {
+        const pending = this.takePending(this.pendingAck, frame.request_id)
+          ?? this.takePending(this.pendingSync, frame.request_id)
+          ?? this.takePending(this.pending, frame.request_id)
+        if (!pending) return
+        const { message, status, code } = frame.error
+        pending.reject(new ApiError(message, status, code))
+        return
+      }
+    }
+  }
+
+  private takePending<T>(requests: Map<string, PendingRequest<T>>, requestId?: string): PendingRequest<T> | undefined {
+    if (!requestId) return
+    const pending = requests.get(requestId)
+    if (!pending) return
+    requests.delete(requestId)
+    window.clearTimeout(pending.timer)
+    return pending
   }
 
   private scheduleReconnect(refresh: boolean): void {
@@ -242,4 +255,3 @@ export class WebSocketManager implements RealtimeGateway {
     this.pending.clear()
   }
 }
-

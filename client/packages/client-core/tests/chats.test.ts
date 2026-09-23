@@ -85,7 +85,8 @@ function setup() {
 test('cached messages and chat selection restore even when remote catch-up fails', async () => {
   const { store, messenger, gateway, saved } = setup()
   saved.set('alice', chats[0].id)
-  messenger.restoreLocal = async () => ({ ...mailbox([message()]), chats })
+  messenger.restoreMetadata = async () => ({ ...mailbox(), chats })
+  messenger.loadChatHistory = async () => ({ messages: [message()], nextBefore: null })
   messenger.loadMailbox = async () => { throw new Error('Offline mailbox') }
   gateway.getChats = async () => { throw new Error('Offline chats') }
   await store.getState().start('alice')
@@ -98,7 +99,7 @@ test('cached messages and chat selection restore even when remote catch-up fails
 test('an empty local chat cache preserves the preference until the server list is loaded', async () => {
   const { store, messenger, saved } = setup()
   saved.set('alice', chats[0].id)
-  messenger.restoreLocal = async () => ({ ...mailbox(), chats: [] })
+  messenger.restoreMetadata = async () => ({ ...mailbox(), chats: [] })
   await store.getState().start('alice')
   assert.equal(store.getState().selectedChat?.id, chats[0].id)
   assert.equal(saved.get('alice'), chats[0].id)
@@ -376,7 +377,7 @@ test('ready events during a mailbox load coalesce into exactly one following rel
 })
 
 test('mailbox and live decoding errors are surfaced and a successful reload clears the mailbox error', async () => {
-  const { store, messenger, listeners } = setup()
+  const { store, messenger, listeners, ready } = setup()
   messenger.loadMailbox = async () => { throw new Error('Mailbox failed') }
   await store.getState().start('alice')
   assert.equal(store.getState().mailboxError, 'Mailbox failed')
@@ -384,7 +385,8 @@ test('mailbox and live decoding errors are surfaced and a successful reload clea
   for (const onError of listeners.values()) onError(new Error('Decode failed'))
   assert.equal(store.getState().mailboxError, 'Decode failed')
   messenger.loadMailbox = async () => mailbox()
-  await store.getState().reloadMailbox()
+  ready()
+  await flush()
   assert.equal(store.getState().mailboxError, null)
 })
 
@@ -568,11 +570,10 @@ test('incoming delta batches merge once and delivery updates preserve the existi
 
 
 test('history opens only the selected chat, pages independently, and ignores duplicate updates', async () => {
-  const { store, messenger, receive } = setup()
+  const { store, messenger, receive, ready } = setup()
   const reads: Array<[string, unknown]> = []
   const cursor = { createdAt: timestamp, id: 'older' }
   messenger.restoreMetadata = async () => ({ ...mailbox(), chats })
-  messenger.restoreLocal = async () => { throw new Error('Full restoration forbidden') }
   messenger.loadChatHistory = async (id, before) => {
     reads.push([id, before])
     return { messages: [message(before ? 'older' : 'latest', id)], nextBefore: before ? null : cursor }
@@ -586,7 +587,7 @@ test('history opens only the selected chat, pages independently, and ignores dup
   assert.equal(store.getState().messagesByChat.get(chats[0].id), first)
   const sync = deferred<MailboxLoadResult>()
   messenger.loadMailbox = () => sync.promise
-  const reload = store.getState().reloadMailbox()
+  ready()
   assert.equal(store.getState().historyByChat.get(chats[0].id)?.loading, false)
   assert.equal(store.getState().messagesByChat.get(chats[0].id), first)
   await store.getState().loadPreviousMessages()
@@ -596,7 +597,7 @@ test('history opens only the selected chat, pages independently, and ignores dup
   await store.getState().loadPreviousMessages()
   assert.equal(reads.length, 2)
   sync.resolve(mailbox())
-  await reload
+  await flush()
   store.getState().dispose()
 })
 

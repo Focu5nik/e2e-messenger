@@ -43,7 +43,7 @@ This inventory is checked against TypeScript's resolved entry-point exports by
 | Runtime: messaging | `MessengerService`, `PlaintextMessageCodec`, `SyncManager`, `mergeMessages` |
 | Types: domain | `User`, `CurrentUser`, `DeviceIdentity`, `LoginDevice`, `Device`, `DirectChat`, `DestinationDevice`, `SentMessage`, `MailboxPage`, `ReceivedMessage`, `DisplayMessage`, `MessageDeliveryUpdate` |
 | Types: errors | `ClientErrorCode` |
-| Types: HTTP protocol | `CredentialsRequest`, `LoginRequest`, `TokenResponse`, `UserDto`, `CurrentUserDto`, `DeviceDto`, `DirectChatDto`, `DestinationDeviceDto`, `SentMessageDto`, `MailboxPageDto`, `ErrorDetail`, `ErrorResponse` |
+| Types: HTTP protocol | `CredentialsRequest`, `LoginRequest`, `TokenResponse`, `UserDto`, `CurrentUserDto`, `DeviceDto`, `DirectChatDto`, `DestinationDeviceDto`, `SentMessageDto`, `MailboxPageDto` |
 | Types: message / realtime protocol | `ClientEnvelope`, `SendMessageRequest`, `MessageEnvelope`, `MailboxEnvelope`, `ServerEvent`, `ClientEvent` |
 | Types: gateways | `SessionGateway`, `AccountGateway`, `ChatGateway`, `MessagingGateway`, `RealtimeGateway` |
 | Types: platform ports | `DeviceIdentityStore`, `ChatPreferencesStore`, `DeviceDescription`, `IdGenerator`, `TextEncoding` |

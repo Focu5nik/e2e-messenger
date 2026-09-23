@@ -36,6 +36,50 @@ function indexedRecord(entry: Stored<MailboxEnvelope | OutgoingCommand>): Stored
     history: [entry.scope, value.chat_id, value.message_created_at, `envelope:${value.id}`] }
 }
 
+function migrateSchema(database: IDBDatabase, transaction: IDBTransaction): void {
+  for (const name of STORES) {
+    const store = database.objectStoreNames.contains(name)
+      ? transaction.objectStore(name)
+      : database.createObjectStore(name, { keyPath: 'key' })
+    if (name !== 'identity' && !store.indexNames.contains('scope')) store.createIndex('scope', 'scope')
+    if (name === 'envelopes' || name === 'outgoing') {
+      if (!store.indexNames.contains('pending')) store.createIndex('pending', 'pending')
+      if (!store.indexNames.contains('history')) store.createIndex('history', 'history')
+      if (name === 'outgoing' && !store.indexNames.contains('message')) store.createIndex('message', 'message', { unique: true })
+      const cursor = store.openCursor()
+      cursor.onsuccess = () => {
+        if (!cursor.result) return
+        cursor.result.update(indexedRecord(cursor.result.value))
+        cursor.result.continue()
+      }
+    }
+  }
+}
+
+function readHistoryEntries(index: IDBIndex, range: IDBKeyRange, count: number): Promise<Stored<MailboxEnvelope | OutgoingCommand>[]> {
+  return new Promise((resolve, reject) => {
+    const entries: Stored<MailboxEnvelope | OutgoingCommand>[] = []
+    const cursor = index.openCursor(range, 'prev')
+    cursor.onerror = () => reject(cursor.error)
+    cursor.onsuccess = () => {
+      if (!cursor.result || entries.length === count) {
+        resolve(entries)
+        return
+      }
+      entries.push(cursor.result.value)
+      cursor.result.continue()
+    }
+  })
+}
+
+function mergeDeliveryMetadata(envelope: MessageEnvelope, prior?: MessageEnvelope): MessageEnvelope {
+  return {
+    ...envelope,
+    delivered_at: envelope.delivered_at ?? prior?.delivered_at ?? null,
+    payload_purged_at: envelope.payload_purged_at ?? prior?.payload_purged_at ?? null,
+  }
+}
+
 function mergeReceipt(envelope: MessageEnvelope, receipt?: MessageEnvelope): MessageEnvelope {
   if (!receipt || receipt.message_id !== envelope.message_id || receipt.recipient_device_id !== envelope.recipient_device_id) return envelope
   return { ...envelope, delivered_at: envelope.delivered_at ?? receipt.delivered_at,
@@ -60,23 +104,7 @@ export class IndexedDBDurableInbox implements DurableInbox {
         )
         let blocked = false
         opening.onupgradeneeded = () => {
-          for (const name of STORES) {
-            const store = opening.result.objectStoreNames.contains(name)
-              ? opening.transaction!.objectStore(name)
-              : opening.result.createObjectStore(name, { keyPath: 'key' })
-            if (name !== 'identity' && !store.indexNames.contains('scope')) store.createIndex('scope', 'scope')
-            if (name === 'envelopes' || name === 'outgoing') {
-              if (!store.indexNames.contains('pending')) store.createIndex('pending', 'pending')
-              if (!store.indexNames.contains('history')) store.createIndex('history', 'history')
-              if (name === 'outgoing' && !store.indexNames.contains('message')) store.createIndex('message', 'message', { unique: true })
-              const cursor = store.openCursor()
-              cursor.onsuccess = () => {
-                if (!cursor.result) return
-                cursor.result.update(indexedRecord(cursor.result.value))
-                cursor.result.continue()
-              }
-            }
-          }
+          migrateSchema(opening.result, opening.transaction!)
         }
         opening.onsuccess = () => {
           const db = opening.result
@@ -216,17 +244,10 @@ export class IndexedDBDurableInbox implements DurableInbox {
       await this.validate(tx, scope)
       const prefix = [scopeKey(scope), chatId]
       const range = IDBKeyRange.bound(prefix, before ? [...prefix, before.createdAt, before.id] : [...prefix, []], false, true)
-      const read = (name: 'envelopes' | 'outgoing') => new Promise<Stored<MailboxEnvelope | OutgoingCommand>[]>((resolve, reject) => {
-        const entries: Stored<MailboxEnvelope | OutgoingCommand>[] = []
-        const cursor = tx.objectStore(name).index('history').openCursor(range, 'prev')
-        cursor.onerror = () => reject(cursor.error)
-        cursor.onsuccess = () => {
-          if (!cursor.result || entries.length === limit + 1) { resolve(entries); return }
-          entries.push(cursor.result.value)
-          cursor.result.continue()
-        }
-      })
-      const entries = (await Promise.all([read('envelopes'), read('outgoing')])).flat()
+      const entries = (await Promise.all([
+        readHistoryEntries(tx.objectStore('envelopes').index('history'), range, limit + 1),
+        readHistoryEntries(tx.objectStore('outgoing').index('history'), range, limit + 1),
+      ])).flat()
         .sort((a, b) => (this.options.indexedDB ?? globalThis.indexedDB).cmp(b.history!, a.history!))
       const page = entries.slice(0, limit)
       const last = page.at(-1)?.history
@@ -318,17 +339,6 @@ export class IndexedDBDurableInbox implements DurableInbox {
     })
   }
 
-  async rejectOutgoing(scope: InboxScope, clientMessageId: string): Promise<void> {
-    await this.transaction('readwrite', ['identity', 'outgoing'], async (tx) => {
-      await this.validate(tx, scope)
-      const store = tx.objectStore('outgoing')
-      const key = record(scopeKey(scope), clientMessageId, null).key
-      const existing = await request(store.get(key)) as Stored<OutgoingCommand> | undefined
-      if (existing?.value.accepted) throw new Error('Accepted outgoing command cannot be rejected')
-      await request(store.delete(key))
-    })
-  }
-
   async acceptOutgoing(scope: InboxScope, message: SentMessage): Promise<OutgoingCommand> {
     return this.transaction('readwrite', ['identity', 'outgoing', 'receipts'], async (tx) => {
       await this.validate(tx, scope)
@@ -340,18 +350,20 @@ export class IndexedDBDurableInbox implements DurableInbox {
       const existing = await request(store.get(key)) as Stored<OutgoingCommand> | undefined
       if (!existing) throw new Error('Missing durable outgoing command')
       if (existing.value.command.chat_id !== message.chatId) throw new Error('Accepted message belongs to another chat')
-      const value: OutgoingCommand = { ...existing.value, createdAt: existing.value.createdAt ?? existing.value.accepted?.createdAt ?? '', accepted: { ...message, envelopes: message.envelopes.map(envelope => {
-        const prior = existing.value.accepted?.envelopes.find(item => item.id === envelope.id)
-        return { ...envelope, delivered_at: envelope.delivered_at ?? prior?.delivered_at ?? null,
-          payload_purged_at: envelope.payload_purged_at ?? prior?.payload_purged_at ?? null }
-      }) } }
-      for (let index = 0; index < value.accepted!.envelopes.length; index += 1) {
-        const envelope = value.accepted!.envelopes[index]
+      const previousAcceptance = existing.value.accepted
+      const createdAt = existing.value.createdAt ?? previousAcceptance?.createdAt ?? ''
+      const envelopes: MessageEnvelope[] = []
+      const receipts = tx.objectStore('receipts')
+      for (const envelope of message.envelopes) {
+        const prior = previousAcceptance?.envelopes.find(item => item.id === envelope.id)
+        const envelopeWithMetadata = mergeDeliveryMetadata(envelope, prior)
         const receiptKey = record(scopeKey(scope), envelope.id, null).key
-        const receipt = await request(tx.objectStore('receipts').get(receiptKey)) as Stored<MessageEnvelope> | undefined
-        value.accepted!.envelopes[index] = mergeReceipt(envelope, receipt?.value)
-        await request(tx.objectStore('receipts').delete(receiptKey))
+        const receipt = await request(receipts.get(receiptKey)) as Stored<MessageEnvelope> | undefined
+        envelopes.push(mergeReceipt(envelopeWithMetadata, receipt?.value))
+        await request(receipts.delete(receiptKey))
       }
+      const accepted: SentMessage = { ...message, envelopes }
+      const value: OutgoingCommand = { ...existing.value, createdAt, accepted }
       await request(store.put(indexedRecord({ ...existing, value })))
       return value
     })

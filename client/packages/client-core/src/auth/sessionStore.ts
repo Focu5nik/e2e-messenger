@@ -65,6 +65,22 @@ export function createSessionStore({ session, account, identities, prepareInbox 
       if (isCurrent(operation)) set({ user, devices, authError: null, phase: 'authenticated' })
     }
 
+    async function loginWithDeviceReplacement(username: string, password: string, operation: number) {
+      const device = await identities.get()
+      if (!isCurrent(operation)) return
+      set({ deviceIdentity: device })
+      try {
+        await session.login(username, password, device)
+      } catch (error) {
+        if (!isCurrent(operation)) return
+        if (!(error instanceof ClientError) || error.code !== 'device_revoked') throw error
+        const replacement = await identities.replace()
+        if (!isCurrent(operation)) return
+        set({ deviceIdentity: replacement })
+        await session.login(username, password, replacement)
+      }
+    }
+
     async function authenticate(username: string, password: string, registering: boolean): Promise<boolean> {
       if (!active || get().phase !== 'anonymous' || get().submitting || get().signingOut) return false
       const operation = ++generation
@@ -77,19 +93,7 @@ export function createSessionStore({ session, account, identities, prepareInbox 
           if (!isCurrent(operation)) return false
           registered = true
         }
-        const device = await identities.get()
-        if (!isCurrent(operation)) return false
-        set({ deviceIdentity: device })
-        try {
-          await session.login(normalizedUsername, password, device)
-        } catch (error) {
-          if (!isCurrent(operation)) return false
-          if (!(error instanceof ClientError) || error.code !== 'device_revoked') throw error
-          const replacement = await identities.replace()
-          if (!isCurrent(operation)) return false
-          set({ deviceIdentity: replacement })
-          await session.login(normalizedUsername, password, replacement)
-        }
+        await loginWithDeviceReplacement(normalizedUsername, password, operation)
         if (!isCurrent(operation)) return false
         await loadAccount(operation)
       } catch (error) {

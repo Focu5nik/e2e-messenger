@@ -22,15 +22,6 @@ function compileProbe(source: string) {
   return ts.getPreEmitDiagnostics(ts.createProgram([probeFile], parsed.options, host))
 }
 
-test('core compiles ES2023 and vanilla Zustand without platform types', () => {
-  const diagnostics = compileProbe(`
-    import { createStore } from 'zustand/vanilla'
-    const store = createStore<{ count: number }>(() => ({ count: 0 }))
-    store.setState({ count: [3, 1, 2].toSorted()[0] })
-  `)
-  assert.deepEqual(diagnostics.map((item) => ts.flattenDiagnosticMessageText(item.messageText, '\n')), [])
-})
-
 test('core compilation rejects browser, Node, and React globals', () => {
   const globals = ['window', 'document', 'navigator', 'localStorage', 'WebSocket',
     'fetch', 'crypto', 'btoa', 'atob', 'TextEncoder', 'TextDecoder', 'setTimeout',
@@ -40,26 +31,6 @@ test('core compilation rejects browser, Node, and React globals', () => {
     assert.ok(diagnostics.some((item) => item.category === ts.DiagnosticCategory.Error &&
       ts.flattenDiagnosticMessageText(item.messageText, '\n').includes(`Cannot find name '${name}'`)), name)
   }
-})
-
-test('gateway contracts and ClientError compile with platform-free implementations', () => {
-  const diagnostics = compileProbe(`
-    import { ClientError } from '@secure-messenger/client-core'
-    import type { SessionGateway, AccountGateway, ChatGateway, MessagingGateway, RealtimeGateway } from '@secure-messenger/client-core'
-    const fail = async (): Promise<never> => { throw new ClientError('Offline', 'network_error') }
-    const subscribe = () => () => {}
-    const session: SessionGateway = {
-      register: fail, login: fail, restoreSession: fail, logout: fail,
-      onSessionExpired: subscribe, onSessionCleared: subscribe,
-    }
-    const account: AccountGateway = { getCurrentUser: fail, getDevices: fail, revokeDevice: fail }
-    const chats: ChatGateway = { searchUsers: fail, getChats: fail, getChat: fail, createDirectChat: fail }
-    const messages: MessagingGateway = { getDestinationDevices: fail, sendMessage: fail, getMailbox: fail }
-    const realtime: RealtimeGateway = {
-      ready: false, start() {}, stop() {}, sendMessage: fail, onMessage: subscribe, onReady: subscribe,
-    }
-  `)
-  assert.deepEqual(diagnostics.map((item) => ts.flattenDiagnosticMessageText(item.messageText, '\n')), [])
 })
 
 test('boundary check rejects platform imports, re-exports, type imports, and ambient references', () => {

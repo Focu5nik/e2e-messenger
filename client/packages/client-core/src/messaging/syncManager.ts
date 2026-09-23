@@ -1,7 +1,7 @@
 import type { CurrentUser, MailboxPage } from '../domain/models.ts'
-import type { DurableInbox, InboxScope, InboxSnapshot } from '../ports/durableInbox.ts'
+import type { DurableInbox, InboxScope } from '../ports/durableInbox.ts'
 import type { MessagingGateway, RealtimeGateway } from '../ports/gateways.ts'
-import type { MailboxEnvelope } from '../protocol/contracts.ts'
+import type { MailboxEnvelope, MessageEnvelope } from '../protocol/contracts.ts'
 
 type SyncChanges = { cursor: number; envelopes: MailboxEnvelope[] }
 
@@ -34,8 +34,6 @@ export class SyncManager {
     if (!this.current) throw new Error('Local message storage is not ready. Please sign in again.')
     return this.current
   }
-
-  snapshot(): Promise<InboxSnapshot> { return this.inbox.snapshot(this.scope()) }
 
   synchronize(): Promise<SyncChanges> {
     const scope = this.scope()
@@ -91,23 +89,34 @@ export class SyncManager {
     for (const envelope of pending) {
       if (envelope.payload === null || envelope.delivered_at !== null) continue
       this.assertCurrent(scope)
-      let receipt
-      try { receipt = await gateway.acknowledgeEnvelope(envelope.id) }
-      catch {
+      let receipt: MessageEnvelope
+      try {
+        receipt = await gateway.acknowledgeEnvelope(envelope.id)
+      } catch {
         // Delivery is already durable. An unavailable ACK transport must not hide
         // local messages; the missing delivered_at retries on the next sync.
         this.assertCurrent(scope)
         continue
       }
       this.assertCurrent(scope)
-      if (receipt.id !== envelope.id || receipt.message_id !== envelope.message_id
-        || receipt.recipient_device_id !== scope.deviceId || !receipt.delivered_at) {
-        throw new Error('Invalid delivery receipt.')
-      }
+      this.validateReceipt(scope, envelope, receipt)
       const cursor = await this.inbox.readCursor(scope)
       // Persist the receipt only; server purge must never erase the local payload.
-      try { this.collect(changes, await this.inbox.commitPage(scope, cursor, [{ ...envelope, ...receipt, payload: envelope.payload }], cursor)) }
-      catch { this.assertCurrent(scope) } // Lost receipt commit is safe to retry idempotently.
+      const acknowledgedEnvelope: MailboxEnvelope = { ...envelope, ...receipt, payload: envelope.payload }
+      try {
+        const persistedEnvelopes = await this.inbox.commitPage(scope, cursor, [acknowledgedEnvelope], cursor)
+        this.collect(changes, persistedEnvelopes)
+      } catch {
+        // Lost receipt commit is safe to retry idempotently.
+        this.assertCurrent(scope)
+      }
+    }
+  }
+
+  private validateReceipt(scope: InboxScope, envelope: MailboxEnvelope, receipt: MessageEnvelope): void {
+    if (receipt.id !== envelope.id || receipt.message_id !== envelope.message_id
+      || receipt.recipient_device_id !== scope.deviceId || !receipt.delivered_at) {
+      throw new Error('Invalid delivery receipt.')
     }
   }
 

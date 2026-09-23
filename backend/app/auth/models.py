@@ -1,10 +1,14 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+if TYPE_CHECKING:
+    from app.messages.models import DeviceMailbox
 
 
 class User(Base):
@@ -54,6 +58,12 @@ class Device(Base):
         lazy="raise",
         passive_deletes=True,
     )
+    mailbox: Mapped["DeviceMailbox | None"] = relationship(
+        back_populates="device",
+        cascade="save-update, merge, delete",
+        lazy="raise",
+        passive_deletes=True,
+    )
 
 
 class AuthSession(Base):
@@ -83,6 +93,12 @@ class AuthSession(Base):
     device: Mapped["Device"] = relationship(
         back_populates="auth_sessions", lazy="raise"
     )
+    refresh_token_history: Mapped[list["RefreshTokenHistory"]] = relationship(
+        back_populates="auth_session",
+        cascade="save-update, merge, delete",
+        lazy="raise",
+        passive_deletes=True,
+    )
 
 
 class RefreshTokenHistory(Base):
@@ -96,4 +112,7 @@ class RefreshTokenHistory(Base):
     )
     consumed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    auth_session: Mapped["AuthSession"] = relationship(
+        back_populates="refresh_token_history", lazy="raise"
     )

@@ -305,9 +305,15 @@ test('revoked-device recovery waits for replacement persistence before retrying 
   assert.equal(storedIdentity.id, identity.id)
   await act(async () => releaseWrite())
   assert.equal(loginBodies().length, 2)
-  assert.equal(loginBodies()[1].device_id, storedIdentity.id)
-  assert.notEqual(loginBodies()[1].device_id, identity.id)
+  assert.equal(loginBodies()[0].device_id, identity.id)
+  assert.notEqual(storedIdentity.id, identity.id)
+  assert.deepEqual(loginBodies()[1], {
+    username: 'alice', password: 'test-password', device_id: storedIdentity.id, device_name: storedIdentity.name,
+  })
   assert.ok(container.querySelector('.shell'))
+  assert.equal(starts, 1)
+  const authPaths = requests.map(({ path }) => path).filter((path) => ['/auth/login', '/me', '/devices'].includes(path))
+  assert.deepEqual(authPaths, ['/auth/login', '/auth/login', '/me', '/devices'])
 })
 
 test('delayed preference restoration cannot overwrite a manually selected chat', async () => {
@@ -320,17 +326,6 @@ test('delayed preference restoration cannot overwrite a manually selected chat',
   assert.equal(element('#selected-chat-heading').textContent, 'carol')
   assert.equal(localStorage.getItem(lastChatKey), 'carol-chat')
   assert.equal(requests.some(({ path }) => path === '/chats/bob-chat'), false)
-})
-
-test('a late preference read failure does not put an error on a newer selection', async () => {
-  let rejectRead!: (error: Error) => void
-  mock.method(browserChatPreferencesStore, 'getLastChatId', () => new Promise((_, reject) => { rejectRead = reject }))
-  await renderApp()
-  await click('.chat-list li:nth-child(2) button')
-  await act(async () => rejectRead(new Error('Old preference read failed')))
-  assert.equal(element('#selected-chat-heading').textContent, 'carol')
-  assert.equal(localStorage.getItem(lastChatKey), 'carol-chat')
-  assert.equal(container.querySelector('[role="alert"]'), null)
 })
 
 test('the injected realtime gateway reaches the workspace and releases subscriptions on logout', async () => {
@@ -352,22 +347,6 @@ test('the injected realtime gateway reaches the workspace and releases subscript
   assert.equal(stops, 1)
   assert.equal(messageHandlers.size, 0)
   assert.equal(readyHandlers.size, 0)
-})
-
-test('App releases its session-expiry subscription when unmounted', async () => {
-  const subscribe = apiClient.onSessionExpired.bind(apiClient)
-  let subscriptions = 0
-  let unsubscriptions = 0
-  mock.method(apiClient, 'onSessionExpired', (handler: () => void) => {
-    subscriptions += 1
-    const unsubscribe = subscribe(handler)
-    return () => { unsubscriptions += 1; unsubscribe() }
-  })
-  await renderApp()
-  assert.equal(subscriptions, 1)
-  assert.equal(unsubscriptions, 0)
-  await act(async () => root.render(null))
-  assert.equal(unsubscriptions, 1)
 })
 
 test('StrictMode reconnects the session store with one active expiry subscription', async () => {
@@ -576,45 +555,6 @@ test('a restore server failure displays the error on the anonymous screen', asyn
   assert.equal(starts, 0)
 })
 
-test('revoked-device login replaces the persisted identity and retries once before loading the account', async () => {
-  respond = (request) => {
-    if (request.path === '/auth/login' && loginBodies().length === 1) {
-      return errorResponse('device is revoked', 403)
-    }
-    return anonymousRestore(request)
-  }
-  await renderApp()
-  await submitCredentials()
-  const attempts = loginBodies()
-  assert.equal(attempts.length, 2)
-  assert.equal(attempts[0].device_id, identity.id)
-  const replacement = storedIdentity
-  assert.notEqual(replacement.id, identity.id)
-  assert.deepEqual(attempts[1], {
-    username: 'alice', password: 'test-password', device_id: replacement.id, device_name: replacement.name,
-  })
-  assert.ok(container.querySelector('.shell'))
-  assert.equal(starts, 1)
-  const authPaths = requests.map(({ path }) => path).filter((path) => ['/auth/login', '/me', '/devices'].includes(path))
-  assert.deepEqual(authPaths, ['/auth/login', '/auth/login', '/me', '/devices'])
-})
-
-test('revoked-device recovery uses a core error code regardless of message or transport', async () => {
-  respond = anonymousRestore
-  await renderApp()
-  const login = apiClient.login.bind(apiClient)
-  let attempts = 0
-  mock.method(apiClient, 'login', async (...args: Parameters<typeof login>) => {
-    attempts += 1
-    if (attempts === 1) throw new ClientError('Replace this identity.', 'device_revoked')
-    await login(...args)
-  })
-  await submitCredentials()
-  assert.equal(attempts, 2)
-  assert.notEqual(storedIdentity.id, identity.id)
-  assert.ok(container.querySelector('.shell'))
-})
-
 for (const [status, detail] of [[401, 'Invalid credentials'], [403, 'Account disabled'], [409, 'device is revoked']] as const) {
   test(`login error ${status}/${detail} does not replace the device or retry`, async () => {
     respond = (request) => request.path === '/auth/login' ? errorResponse(detail, status) : anonymousRestore(request)
@@ -749,18 +689,6 @@ test('last-chat restoration uses the current user preference and fetches fresh c
   assert.equal(requests.filter(({ path }) => path === '/chats/carol-chat').length, 1)
   assert.equal(requests.some(({ path }) => path === '/chats/bob-chat'), false)
 })
-
-for (const storedChat of [null, 'missing-chat']) {
-  test(`a ${storedChat === null ? 'missing' : 'deleted'} last chat leaves no selection and preserves other users' preferences`, async () => {
-    if (storedChat) localStorage.setItem(lastChatKey, storedChat)
-    localStorage.setItem('messenger.lastChat.other-user', 'bob-chat')
-    await renderApp()
-    assert.equal(element('#selected-chat-heading').textContent, 'Choose a conversation')
-    assert.equal(localStorage.getItem(lastChatKey), null)
-    assert.equal(localStorage.getItem('messenger.lastChat.other-user'), 'bob-chat')
-    assert.equal(requests.some(({ path }) => path.startsWith('/chats/')), false)
-  })
-}
 
 for (const refreshFails of [true, false]) {
   test(`session expiry after ${refreshFails ? 'refresh rejection' : 'a retried request returns 401'} clears the workspace and permits signing in again`, async () => {

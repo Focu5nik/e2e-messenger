@@ -8,8 +8,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.auth.dependencies import Principal, _is_expired
 from app.auth.models import AuthSession, Device, RefreshTokenHistory, User
+from app.auth.principal import Principal
 from app.auth.schemas import (
     DeviceResponse,
     LoginRequest,
@@ -25,6 +25,7 @@ from app.auth.security import (
     hash_refresh_token,
     verify_password,
 )
+from app.auth.session_policy import is_session_active
 from app.config import Settings
 from app.messages.models import DeviceMailbox
 
@@ -82,58 +83,9 @@ class AuthService:
     async def login(
         self, session: AsyncSession, request: LoginRequest
     ) -> IssuedTokens:
-        user = (
-            await session.execute(select(User).where(User.username == request.username))
-        ).scalar_one_or_none()
-        candidate_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
-        password_matches = await to_thread.run_sync(
-            verify_password, request.password, candidate_hash
-        )
-        if user is None or not password_matches:
-            raise InvalidCredentialsError
-
-        # Message delivery holds a shared lock on this row while resolving and
-        # storing envelopes. An exclusive lock serializes device-set mutations
-        # with that delivery transaction.
-        user = (
-            await session.execute(
-                select(User)
-                .where(User.id == user.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one()
-        if user.status != "active":
-            raise ForbiddenError("account is not active")
-
-        device = await session.get(Device, request.device_id)
+        user = await self._authenticate_and_lock_user(session, request)
         now = datetime.now(UTC)
-        if device is None:
-            device = Device(
-                id=request.device_id,
-                user_id=user.id,
-                name=request.device_name,
-                last_seen_at=now,
-            )
-            session.add(device)
-            # DeviceMailbox has no ORM relationship by design. Flush the device
-            # first to preserve its FK dependency while keeping both inserts in
-            # the same transaction.
-            try:
-                await session.flush()
-            except IntegrityError as exc:
-                await session.rollback()
-                raise ConflictError(
-                    "device identifier is already registered"
-                ) from exc
-            session.add(DeviceMailbox(device_id=device.id))
-        elif device.user_id != user.id:
-            raise ConflictError("device identifier is already registered")
-        elif device.revoked_at is not None:
-            raise ForbiddenError("device is revoked")
-        else:
-            device.name = request.device_name
-            device.last_seen_at = now
+        device = await self._register_or_update_device(session, user, request, now)
 
         token = generate_refresh_token()
         auth_session = AuthSession(
@@ -159,45 +111,91 @@ class AuthService:
             auth_session.refresh_expires_at,
         )
 
+    async def _authenticate_and_lock_user(
+        self, session: AsyncSession, request: LoginRequest
+    ) -> User:
+        user = (
+            await session.execute(select(User).where(User.username == request.username))
+        ).scalar_one_or_none()
+        candidate_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
+        password_matches = await to_thread.run_sync(
+            verify_password, request.password, candidate_hash
+        )
+        if user is None or not password_matches:
+            raise InvalidCredentialsError
+
+        # Message delivery holds a shared lock on this row while resolving and
+        # storing envelopes. An exclusive lock serializes device-set mutations
+        # with that delivery transaction.
+        user = (
+            await session.execute(
+                select(User)
+                .where(User.id == user.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        if user.status != "active":
+            raise ForbiddenError("account is not active")
+
+        return user
+
+    async def _register_or_update_device(
+        self,
+        session: AsyncSession,
+        user: User,
+        request: LoginRequest,
+        now: datetime,
+    ) -> Device:
+        device = await session.get(Device, request.device_id)
+        if device is None:
+            device = Device(
+                id=request.device_id,
+                user_id=user.id,
+                name=request.device_name,
+                last_seen_at=now,
+                mailbox=DeviceMailbox(),
+            )
+            session.add(device)
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise ConflictError(
+                    "device identifier is already registered"
+                ) from exc
+        elif device.user_id != user.id:
+            raise ConflictError("device identifier is already registered")
+        elif device.revoked_at is not None:
+            raise ForbiddenError("device is revoked")
+        else:
+            device.name = request.device_name
+            device.last_seen_at = now
+
+        return device
+
     async def refresh(
         self, session: AsyncSession, refresh_token: str
     ) -> IssuedTokens:
         refresh_token_hash = hash_refresh_token(refresh_token)
-        auth_session = (
-            await session.execute(
-                select(AuthSession)
-                .options(
-                    selectinload(AuthSession.device).selectinload(Device.user)
-                )
-                .where(
-                    AuthSession.refresh_token_hash == refresh_token_hash
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        # PostgreSQL may wait here for another rotation of the same token. Recheck
-        # the mutable predicate after acquiring the row lock so only one caller
-        # can rotate and every loser follows the consumed-token reuse path.
+        auth_session = await self._lock_current_session(
+            session, refresh_token_hash, load_identity=True
+        )
+        # PostgreSQL may wait for another rotation. Recheck the mutable predicate
+        # after the lock so losing callers follow the consumed-token reuse path.
         if (
             auth_session is not None
             and auth_session.refresh_token_hash != refresh_token_hash
         ):
             auth_session = None
         if auth_session is None:
-            reused_session = (
-                await session.execute(
-                    select(AuthSession)
-                    .join(
-                        RefreshTokenHistory,
-                        RefreshTokenHistory.auth_session_id == AuthSession.id,
-                    )
-                    .where(RefreshTokenHistory.token_hash == refresh_token_hash)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
+            reused_session = await self._lock_consumed_session(
+                session, refresh_token_hash
+            )
             if reused_session is not None:
                 if reused_session.revoked_at is None:
                     reused_session.revoked_at = datetime.now(UTC)
+                # Persist revocation even though the request will fail.
                 await session.commit()
                 raise RefreshTokenReuseError
             raise InvalidCredentialsError
@@ -206,14 +204,7 @@ class AuthService:
         if device is None:
             raise InvalidCredentialsError
         user = device.user
-        if (
-            user is None
-            or user.status != "active"
-            or device.revoked_at is not None
-            or auth_session.revoked_at is not None
-            or not auth_session.refresh_cookie_bound
-            or _is_expired(auth_session.refresh_expires_at)
-        ):
+        if user is None or not is_session_active(user, device, auth_session):
             raise InvalidCredentialsError
 
         now = datetime.now(UTC)
@@ -239,28 +230,42 @@ class AuthService:
 
     async def logout(self, session: AsyncSession, refresh_token: str) -> None:
         refresh_token_hash = hash_refresh_token(refresh_token)
-        auth_session = (
-            await session.execute(
-                select(AuthSession)
-                .where(AuthSession.refresh_token_hash == refresh_token_hash)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
+        auth_session = await self._lock_current_session(session, refresh_token_hash)
         if auth_session is None:
-            auth_session = (
-                await session.execute(
-                    select(AuthSession)
-                    .join(
-                        RefreshTokenHistory,
-                        RefreshTokenHistory.auth_session_id == AuthSession.id,
-                    )
-                    .where(RefreshTokenHistory.token_hash == refresh_token_hash)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
+            auth_session = await self._lock_consumed_session(session, refresh_token_hash)
         if auth_session is not None and auth_session.revoked_at is None:
             auth_session.revoked_at = datetime.now(UTC)
         await session.commit()
+
+    async def _lock_current_session(
+        self,
+        session: AsyncSession,
+        token_hash: str,
+        *,
+        load_identity: bool = False,
+    ) -> AuthSession | None:
+        query = (
+            select(AuthSession)
+            .where(AuthSession.refresh_token_hash == token_hash)
+            .with_for_update()
+        )
+        if load_identity:
+            query = query.options(
+                selectinload(AuthSession.device).selectinload(Device.user)
+            )
+        return (await session.execute(query)).scalar_one_or_none()
+
+    async def _lock_consumed_session(
+        self, session: AsyncSession, token_hash: str
+    ) -> AuthSession | None:
+        return (
+            await session.execute(
+                select(AuthSession)
+                .join(AuthSession.refresh_token_history)
+                .where(RefreshTokenHistory.token_hash == token_hash)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
 
     async def get_me(
         self, session: AsyncSession, principal: Principal

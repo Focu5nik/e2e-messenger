@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
@@ -17,6 +18,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+if TYPE_CHECKING:
+    from app.auth.models import Device, User
+    from app.chats.models import Chat
 
 
 class Message(Base):
@@ -43,6 +48,9 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    chat: Mapped["Chat"] = relationship(lazy="raise")
+    sender_user: Mapped["User"] = relationship(lazy="raise")
+    sender_device: Mapped["Device"] = relationship(lazy="raise")
     envelopes: Mapped[list["MessageEnvelope"]] = relationship(
         back_populates="message",
         lazy="raise",
@@ -59,6 +67,7 @@ class DeviceMailbox(Base):
     last_seq: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
     )
+    device: Mapped["Device"] = relationship(back_populates="mailbox", lazy="raise")
 
 
 class MessageEnvelope(Base):
@@ -114,3 +123,4 @@ class MessageEnvelope(Base):
     message: Mapped["Message"] = relationship(
         back_populates="envelopes", lazy="raise"
     )
+    recipient_device: Mapped["Device"] = relationship(lazy="raise")

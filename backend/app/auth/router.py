@@ -5,11 +5,10 @@ from typing import Annotated, TypeAlias
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import CurrentPrincipal
-from app.auth.models import Device, User
+from app.auth.models import User
 from app.auth.schemas import (
     DeviceResponse,
     LoginRequest,
@@ -172,43 +171,20 @@ async def logout(
 
 
 @router.get("/me", response_model=MeResponse)
-async def me(principal: CurrentPrincipal, session: DatabaseSession) -> MeResponse:
-    user = await session.get(User, principal.user_id)
-    if user is None:  # The auth dependency already enforces this invariant.
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
-    return MeResponse(
-        id=user.id,
-        username=user.username,
-        status=user.status,
-        created_at=user.created_at,
-        device_id=principal.device_id,
-        session_id=principal.session_id,
-    )
+async def me(
+    principal: CurrentPrincipal, session: DatabaseSession, service: Service
+) -> MeResponse:
+    try:
+        return await service.get_me(session, principal)
+    except InvalidCredentialsError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED) from exc
 
 
 @router.get("/devices", response_model=list[DeviceResponse])
 async def devices(
-    principal: CurrentPrincipal, session: DatabaseSession
+    principal: CurrentPrincipal, session: DatabaseSession, service: Service
 ) -> list[DeviceResponse]:
-    owned_devices = (
-        await session.scalars(
-            select(Device)
-            .where(Device.user_id == principal.user_id)
-            .order_by(Device.created_at, Device.id)
-        )
-    ).all()
-    return [
-        DeviceResponse(
-            id=device.id,
-            name=device.name,
-            protocol_version=device.protocol_version,
-            created_at=device.created_at,
-            last_seen_at=device.last_seen_at,
-            revoked_at=device.revoked_at,
-            is_current=device.id == principal.device_id,
-        )
-        for device in owned_devices
-    ]
+    return await service.list_devices(session, principal)
 
 
 @router.delete("/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT)

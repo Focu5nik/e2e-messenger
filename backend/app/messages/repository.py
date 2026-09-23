@@ -83,7 +83,7 @@ class MessageRepository:
     ) -> uuid.UUID | None:
         pair = await session.execute(
             select(DirectChatPair.user_low_id, DirectChatPair.user_high_id)
-            .join(Chat, Chat.id == DirectChatPair.chat_id)
+            .join(DirectChatPair.chat)
             .where(
                 DirectChatPair.chat_id == chat_id,
                 Chat.type == "DIRECT",

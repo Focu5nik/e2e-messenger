@@ -1,6 +1,3 @@
-import uuid
-from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Annotated, TypeAlias
 
 from fastapi import Depends, HTTPException, status
@@ -9,18 +6,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.models import AuthSession, Device, User
+from app.auth.principal import Principal
 from app.auth.security import AccessTokenError, decode_access_token
+from app.auth.session_policy import is_session_active
 from app.config import get_settings
 from app.database import get_session
 
 bearer_scheme = HTTPBearer(auto_error=False)
-
-
-@dataclass(frozen=True, slots=True)
-class Principal:
-    user_id: uuid.UUID
-    device_id: uuid.UUID
-    session_id: uuid.UUID
 
 
 def unauthorized() -> HTTPException:
@@ -31,12 +23,6 @@ def unauthorized() -> HTTPException:
     )
 
 
-def _is_expired(value: datetime) -> bool:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value <= datetime.now(UTC)
-
- 
 async def get_principal(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -69,11 +55,7 @@ async def authenticate_access_token(token: str, session: AsyncSession) -> Princi
         or device.id != claims.device_id
         or device.user_id != claims.user_id
         or auth_session.device_id != claims.device_id
-        or user.status != "active"
-        or device.revoked_at is not None
-        or auth_session.revoked_at is not None
-        or not auth_session.refresh_cookie_bound
-        or _is_expired(auth_session.refresh_expires_at)
+        or not is_session_active(user, device, auth_session)
     ):
         raise unauthorized()
     return Principal(

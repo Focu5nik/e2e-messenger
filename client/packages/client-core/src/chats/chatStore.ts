@@ -9,7 +9,7 @@ import type { ChatPreferencesService } from './chatPreferences.ts'
 export type ChatStoreDependencies = {
   chats: ChatGateway
   messenger: Pick<MessengerService, 'loadMailbox' | 'subscribe' | 'onReady' | 'sendText'>
-    & Partial<Pick<MessengerService, 'onChatActivity' | 'restoreMetadata' | 'loadChatHistory' | 'setHistoryChats' | 'restoreLocal' | 'cacheChats' | 'onOutgoing' | 'onDelivery' | 'retryOutgoing'>>
+    & Partial<Pick<MessengerService, 'onChatActivity' | 'restoreMetadata' | 'loadChatHistory' | 'setHistoryChats' | 'cacheChats' | 'onOutgoing' | 'onDelivery' | 'retryOutgoing'>>
   preferences: Pick<ChatPreferencesService, 'restore' | 'select'>
 }
 
@@ -49,7 +49,6 @@ export type ChatState = {
   setSearch(value: string): void
   findPeople(): Promise<void>
   openDirectChat(userId: string): Promise<void>
-  reloadMailbox(): Promise<void>
   // True means the message was accepted during the current lifecycle.
   sendText(content: string): Promise<boolean>
   retryMessage(clientMessageId: string): Promise<void>
@@ -69,6 +68,24 @@ type ChatRun = {
   unsubscribeOutgoing: () => void
   unsubscribeDelivery: () => void
   unsubscribeActivity: () => void
+}
+
+function createChatRun(userId: string): ChatRun {
+  return {
+    userId,
+    selection: 0,
+    searchRequest: 0,
+    loadingMailbox: false,
+    reloadRequested: false,
+    historyRequests: new Map(),
+    recentChats: [],
+    discoveredChats: new Set(),
+    unsubscribe: () => {},
+    unsubscribeReady: () => {},
+    unsubscribeOutgoing: () => {},
+    unsubscribeDelivery: () => {},
+    unsubscribeActivity: () => {},
+  }
 }
 
 function initialState() {
@@ -198,49 +215,60 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
       }
     }
 
+    function subscribeToMessenger(current: ChatRun) {
+      current.unsubscribe = messenger.subscribe(
+        (messages) => receive(current, messages),
+        (error) => {
+          if (run === current) set({ mailboxError: errorMessage(error) })
+        },
+      )
+      current.unsubscribeActivity = messenger.onChatActivity?.(ids => receive(current, [], ids)) ?? (() => {})
+      current.unsubscribeOutgoing = messenger.onOutgoing?.(messages => receive(current, messages)) ?? (() => {})
+      current.unsubscribeDelivery = messenger.onDelivery?.(update => {
+        if (run !== current) return
+        const message = get().messagesByChat.get(update.chatId)?.find(item => item.messageId === update.messageId)
+        if (message) receive(current, [{ ...message, ...update }])
+      }) ?? (() => {})
+
+      // Cover messages arriving during connection setup and reconnects.
+      current.unsubscribeReady = messenger.onReady(() => { void loadMailbox(current) })
+    }
+
+    async function restoreLocalState(current: ChatRun) {
+      if (!messenger.restoreMetadata) return
+      try {
+        const local = await messenger.restoreMetadata()
+        if (run !== current) return
+        set((state) => ({
+          chats: state.chats.reduce(upsertChat, local.chats),
+          messagesByChat: mergeMessagesByChat(state.messagesByChat, local.messages),
+        }))
+        for (const chat of local.chats) current.discoveredChats.add(chat.id)
+
+        const selectedChat = local.chats.length ? await preferences.restore(current.userId, local.chats) : null
+        if (run !== current || current.selection !== 0) return
+        set({ selectedChat })
+        if (selectedChat) {
+          retainHistory(current, selectedChat.id)
+          await loadHistory(current, selectedChat.id)
+        }
+      } catch (error) {
+        if (run === current) set({ mailboxError: errorMessage(error) })
+      }
+    }
+
     return {
       ...initialState(),
 
       async start(userId) {
         get().dispose()
-        const current: ChatRun = {
-          userId, selection: 0, searchRequest: 0, loadingMailbox: false, reloadRequested: false,
-          historyRequests: new Map(), recentChats: [],
-          discoveredChats: new Set(), unsubscribe: () => {}, unsubscribeReady: () => {}, unsubscribeOutgoing: () => {}, unsubscribeDelivery: () => {}, unsubscribeActivity: () => {},
-        }
+        const current = createChatRun(userId)
         run = current
         set({ userId })
         messenger.setHistoryChats?.([])
-        current.unsubscribe = messenger.subscribe(
-          (messages) => receive(current, messages),
-          (error) => { if (run === current) set({ mailboxError: errorMessage(error) }) },
-        )
-        current.unsubscribeActivity = messenger.onChatActivity?.(ids => receive(current, [], ids)) ?? (() => {})
-        current.unsubscribeOutgoing = messenger.onOutgoing?.(messages => receive(current, messages)) ?? (() => {})
-        current.unsubscribeDelivery = messenger.onDelivery?.(update => {
-          if (run !== current) return
-          const message = get().messagesByChat.get(update.chatId)?.find(item => item.messageId === update.messageId)
-          if (message) receive(current, [{ ...message, ...update }])
-        }) ?? (() => {})
-        // Cover messages arriving during connection setup and reconnects.
-        current.unsubscribeReady = messenger.onReady(() => { void loadMailbox(current) })
-        const restore = messenger.restoreMetadata ?? messenger.restoreLocal
-        if (restore) {
-          try {
-            const local = await restore.call(messenger)
-            if (run !== current) return
-            set((state) => ({ chats: state.chats.reduce(upsertChat, local.chats), messagesByChat: mergeMessagesByChat(state.messagesByChat, local.messages) }))
-            for (const chat of local.chats) current.discoveredChats.add(chat.id)
-            const selectedChat = local.chats.length ? await preferences.restore(userId, local.chats) : null
-            if (run !== current) return
-            if (current.selection === 0) {
-              set({ selectedChat })
-              if (selectedChat) { retainHistory(current, selectedChat.id); await loadHistory(current, selectedChat.id) }
-            }
-          } catch (error) {
-            if (run === current) set({ mailboxError: errorMessage(error) })
-          }
-        }
+
+        subscribeToMessenger(current)
+        if (messenger.restoreMetadata) await restoreLocalState(current)
         if (run !== current) return
         await Promise.all([loadChats(current), loadMailbox(current)])
       },
@@ -331,8 +359,6 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         const chatId = get().selectedChat?.id
         if (run && chatId) await loadHistory(run, chatId, get().historyByChat.get(chatId)?.loaded ?? false)
       },
-
-      async reloadMailbox() { if (run) await loadMailbox(run) },
 
       async retryMessage(clientMessageId) {
         const current = run

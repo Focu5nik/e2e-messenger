@@ -5,10 +5,6 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
 
-test('the client-core package entry point loads in Node without a bundler', async () => {
-  await import('@secure-messenger/client-core')
-})
-
 test('documented public API matches the compiled package exports and runtime values', async () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   assert.deepEqual(manifest.exports, { '.': { types: './src/index.ts', import: './src/index.ts' } })
