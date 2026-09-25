@@ -6,11 +6,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth.models import Device, User
-from app.chats.models import Chat, DirectChatPair
+from app.chats.models import Chat, ChatMember, ChatReadState
 from app.messages.models import DeviceMailbox, Message, MessageEnvelope
 
 
 class MessageRepository:
+    async def chat_position_exists(
+        self, session: AsyncSession, chat_id: uuid.UUID, chat_seq: int,
+    ) -> bool:
+        return await session.scalar(
+            select(Message.id).where(Message.chat_id == chat_id, Message.chat_seq == chat_seq)
+        ) is not None
+
     async def acknowledge(
         self,
         session: AsyncSession,
@@ -37,13 +44,13 @@ class MessageRepository:
         )
         if envelope is None:
             return None
-        sender_device_id = await session.scalar(
-            select(Message.sender_device_id)
+        sender_user_id = await session.scalar(
+            select(Message.sender_user_id)
             .join(Message.envelopes)
             .where(MessageEnvelope.id == envelope_id)
         )
-        assert sender_device_id is not None
-        return envelope, sender_device_id
+        assert sender_user_id is not None
+        return envelope, sender_user_id
 
     async def lock_device_set(
         self,
@@ -75,29 +82,40 @@ class MessageRepository:
             return None
         return message, list(message.envelopes)
 
-    async def get_other_user_id(
+    async def sent_page(
         self,
         session: AsyncSession,
-        requester_id: uuid.UUID,
-        chat_id: uuid.UUID,
-    ) -> uuid.UUID | None:
-        pair = await session.execute(
-            select(DirectChatPair.user_low_id, DirectChatPair.user_high_id)
-            .join(DirectChatPair.chat)
+        user_id: uuid.UUID,
+        after_message_id: uuid.UUID | None,
+        limit: int,
+        unread_only: bool = False,
+    ) -> list[Message]:
+        query = (
+            select(Message)
+            .join(Message.chat)
             .where(
-                DirectChatPair.chat_id == chat_id,
-                Chat.type == "DIRECT",
-                (
-                    (DirectChatPair.user_low_id == requester_id)
-                    | (DirectChatPair.user_high_id == requester_id)
-                ),
+                Message.sender_user_id == user_id,
+                Chat.members.any(ChatMember.user_id == user_id),
             )
+            .options(selectinload(Message.envelopes).defer(MessageEnvelope.payload, raiseload=True))
+            .order_by(Message.id)
+            .limit(limit + 1)
         )
-        row = pair.one_or_none()
-        if row is None:
-            return None
-        low_id, high_id = row
-        return high_id if low_id == requester_id else low_id
+        if after_message_id is not None:
+            query = query.where(Message.id > after_message_id)
+        if unread_only:
+            peer_has_read = (
+                select(ChatReadState.chat_id)
+                .where(
+                    ChatReadState.chat_id == Message.chat_id,
+                    ChatReadState.user_id != user_id,
+                    ChatReadState.last_read_seq >= Message.chat_seq,
+                )
+                .correlate(Message)
+                .exists()
+            )
+            query = query.where(~peer_has_read)
+        return list((await session.scalars(query)).all())
 
     async def get_active_devices(
         self,

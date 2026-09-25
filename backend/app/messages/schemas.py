@@ -26,6 +26,7 @@ class SendMessageRequest(BaseModel):
 
 class DestinationDeviceResponse(BaseModel):
     id: uuid.UUID
+    user_id: uuid.UUID
     protocol_version: int
 
 
@@ -33,6 +34,7 @@ class EnvelopeResponse(BaseModel):
     id: uuid.UUID
     message_id: uuid.UUID
     recipient_device_id: uuid.UUID
+    recipient_user_id: uuid.UUID
     mailbox_seq: int
     protocol_version: int
     envelope_type: str
@@ -52,6 +54,7 @@ class EnvelopeResponse(BaseModel):
 class MessageResponse(BaseModel):
     id: uuid.UUID
     chat_id: uuid.UUID
+    chat_seq: int
     sender_user_id: uuid.UUID
     sender_device_id: uuid.UUID
     client_message_id: uuid.UUID
@@ -61,6 +64,7 @@ class MessageResponse(BaseModel):
 
 class MailboxEnvelopeResponse(EnvelopeResponse):
     chat_id: uuid.UUID
+    chat_seq: int
     sender_user_id: uuid.UUID
     sender_device_id: uuid.UUID
     client_message_id: uuid.UUID
@@ -70,4 +74,10 @@ class MailboxEnvelopeResponse(EnvelopeResponse):
 class MailboxPageResponse(BaseModel):
     envelopes: list[MailboxEnvelopeResponse]
     next_seq: int
+    has_more: bool
+
+
+class SentMessagesPageResponse(BaseModel):
+    messages: list[MessageResponse]
+    next_message_id: uuid.UUID | None
     has_more: bool

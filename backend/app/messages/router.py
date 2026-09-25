@@ -1,32 +1,32 @@
 import uuid
-from typing import Annotated, TypeAlias
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, HTTPException, Query, status
 
+from app.chats.errors import ChatNotFoundError
 from app.auth.dependencies import CurrentPrincipal
-from app.database import get_session
-from app.messages.dependencies import Service
+from app.messages.dependencies import DatabaseSession, Service
 from app.messages.error_responses import MessageErrorDescription, describe_message_error
-from app.messages.responses import envelope_response, mailbox_response, message_response
+from app.messages.errors import (
+    DeliveryTargetsChangedError,
+    DuplicateDestinationError,
+    EnvelopeNotFoundError,
+    InvalidEnvelopeError,
+)
+from app.messages.responses import (
+    envelope_response, mailbox_response, message_response, sent_messages_response,
+)
 from app.messages.schemas import (
     DestinationDeviceResponse,
     EnvelopeResponse,
     MailboxPageResponse,
     MessageResponse,
     SendMessageRequest,
-)
-from app.messages.service import (
-    ChatNotFoundError,
-    DeliveryTargetsChangedError,
-    DuplicateDestinationError,
-    EnvelopeNotFoundError,
-    InvalidEnvelopeError,
+    SentMessagesPageResponse,
 )
 
 
 router = APIRouter()
-DatabaseSession: TypeAlias = Annotated[AsyncSession, Depends(get_session)]
 
 
 def message_http_error(description: MessageErrorDescription) -> HTTPException:
@@ -36,6 +36,17 @@ def message_http_error(description: MessageErrorDescription) -> HTTPException:
         else description.message
     )
     return HTTPException(status_code=description.status, detail=detail)
+
+
+@router.get("/messages/sent", response_model=SentMessagesPageResponse)
+async def sent_messages(
+    principal: CurrentPrincipal, session: DatabaseSession, service: Service,
+    after_message_id: uuid.UUID | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    unread_only: bool = False,
+) -> SentMessagesPageResponse:
+    page = await service.sent_page(session, principal, after_message_id, limit, unread_only)
+    return sent_messages_response(page)
 
 
 @router.get("/messages/by-client-id/{client_message_id}", response_model=MessageResponse)
@@ -81,7 +92,7 @@ async def destination_devices(
         raise message_http_error(describe_message_error(exc)) from exc
     return [
         DestinationDeviceResponse(
-            id=device.id, protocol_version=device.protocol_version
+            id=device.id, user_id=device.user_id, protocol_version=device.protocol_version
         )
         for device in devices
     ]

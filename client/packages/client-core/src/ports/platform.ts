@@ -23,3 +23,5 @@ export interface TextEncoding {
   // Reject malformed Base64.
   decodeBase64(value: string): Uint8Array
 }
+
+export interface Scheduler { schedule(callback: () => void, delayMs: number): () => void }

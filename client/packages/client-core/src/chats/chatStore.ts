@@ -1,5 +1,5 @@
 import { createStore } from 'zustand/vanilla'
-import type { DirectChat, DisplayMessage, User } from '../domain/models.ts'
+import type { ChatReadState, DirectChat, DisplayMessage, User } from '../domain/models.ts'
 import type { ChatHistoryCursor } from '../ports/durableInbox.ts'
 import type { ChatGateway } from '../ports/gateways.ts'
 import type { MessengerService } from '../messaging/messengerService.ts'
@@ -9,7 +9,7 @@ import type { ChatPreferencesService } from './chatPreferences.ts'
 export type ChatStoreDependencies = {
   chats: ChatGateway
   messenger: Pick<MessengerService, 'loadMailbox' | 'subscribe' | 'onReady' | 'sendText'>
-    & Partial<Pick<MessengerService, 'onChatActivity' | 'restoreMetadata' | 'loadChatHistory' | 'setHistoryChats' | 'cacheChats' | 'onOutgoing' | 'onDelivery' | 'retryOutgoing'>>
+    & Partial<Pick<MessengerService, 'onReadState' | 'advanceReadCursor' | 'onChatActivity' | 'restoreMetadata' | 'loadChatHistory' | 'setHistoryChats' | 'cacheChats' | 'onOutgoing' | 'onDelivery' | 'retryOutgoing'>>
   preferences: Pick<ChatPreferencesService, 'restore' | 'select'>
 }
 
@@ -36,6 +36,8 @@ export type ChatState = {
   searchError: string | null
   openingUserId: string | null
   messagesByChat: MessagesByChat
+  readStatesByChat: ReadonlyMap<string, ChatReadState>
+  reportVisibleMessages(chatId: string, lastReadSeq: number): void
   historyByChat: ReadonlyMap<string, ChatHistoryState>
   loadPreviousMessages(): Promise<void>
   loadingMailbox: boolean
@@ -68,6 +70,7 @@ type ChatRun = {
   unsubscribeOutgoing: () => void
   unsubscribeDelivery: () => void
   unsubscribeActivity: () => void
+  unsubscribeRead: () => void
 }
 
 function createChatRun(userId: string): ChatRun {
@@ -85,6 +88,7 @@ function createChatRun(userId: string): ChatRun {
     unsubscribeOutgoing: () => {},
     unsubscribeDelivery: () => {},
     unsubscribeActivity: () => {},
+    unsubscribeRead: () => {},
   }
 }
 
@@ -93,6 +97,7 @@ function initialState() {
     userId: null, chats: [], selectedChat: null, loadingChats: true, loadingChatId: null,
     chatsError: null, search: '', searchResults: null, searching: false, searchError: null,
     openingUserId: null, messagesByChat: new Map<string, DisplayMessage[]>(), loadingMailbox: true, mailboxError: null,
+    readStatesByChat: new Map<string, ChatReadState>(),
     historyByChat: new Map<string, ChatHistoryState>(),
     sending: false, sendError: null,
   }
@@ -216,6 +221,16 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
     }
 
     function subscribeToMessenger(current: ChatRun) {
+      current.unsubscribeRead = messenger.onReadState?.(incoming => {
+        if (run !== current) return
+        set(state => {
+          const prior = state.readStatesByChat.get(incoming.chatId)
+          return { readStatesByChat: new Map(state.readStatesByChat).set(incoming.chatId, { ...incoming,
+            ownLocalReadSeq: Math.max(prior?.ownLocalReadSeq ?? 0, incoming.ownLocalReadSeq),
+            ownConfirmedReadSeq: Math.max(prior?.ownConfirmedReadSeq ?? 0, incoming.ownConfirmedReadSeq),
+            peerLastReadSeq: Math.max(prior?.peerLastReadSeq ?? 0, incoming.peerLastReadSeq) }) }
+        })
+      }) ?? (() => {})
       current.unsubscribe = messenger.subscribe(
         (messages) => receive(current, messages),
         (error) => {
@@ -281,6 +296,7 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         previous?.unsubscribeOutgoing()
         previous?.unsubscribeDelivery()
         previous?.unsubscribeActivity()
+        previous?.unsubscribeRead()
         messenger.setHistoryChats?.([])
         set(initialState())
       },
@@ -355,6 +371,16 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
         }
       },
 
+      reportVisibleMessages(chatId, lastReadSeq) {
+        const current = run
+        if (!current || get().selectedChat?.id !== chatId || !Number.isSafeInteger(lastReadSeq) || lastReadSeq < 1) return
+        // Only decoded incoming content actually retained by the active view is eligible.
+        if (!get().messagesByChat.get(chatId)?.some(message => message.chatSeq === lastReadSeq && message.senderUserId !== current.userId)) return
+        void messenger.advanceReadCursor?.(chatId, lastReadSeq).catch(error => {
+          if (run === current) set({ mailboxError: errorMessage(error) })
+        })
+      },
+
       async loadPreviousMessages() {
         const chatId = get().selectedChat?.id
         if (run && chatId) await loadHistory(run, chatId, get().historyByChat.get(chatId)?.loaded ?? false)
@@ -378,7 +404,7 @@ export function createChatStore({ chats: gateway, messenger, preferences }: Chat
           const accepted = await messenger.sendText(chat.id, content)
           if (run !== current) return false
           receive(current, [{
-            messageId: accepted.id, chatId: accepted.chatId, senderUserId: accepted.senderUserId,
+            messageId: accepted.id, chatId: accepted.chatId, chatSeq: accepted.chatSeq, senderUserId: accepted.senderUserId,
             content, createdAt: accepted.createdAt, clientMessageId: accepted.clientMessageId, senderDeviceId: accepted.senderDeviceId, status: 'accepted',
           }])
           return true

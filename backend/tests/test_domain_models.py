@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.auth.models import AuthSession, Device, RefreshTokenHistory, User
-from app.chats.models import Chat, ChatMember, DirectChatPair
+from app.chats.models import Chat, ChatMember, ChatReadState, DirectChatPair
 from app.messages.models import DeviceMailbox, Message, MessageEnvelope
 
 
@@ -33,14 +33,17 @@ async def domain_graph(session_factory: async_sessionmaker[AsyncSession]) -> Non
         # Composite membership constraints require members before the pair.
         await session.flush()
         chat.direct_pair = DirectChatPair(user_low=low_user, user_high=high_user)
+        session.add(ChatReadState(chat_id=chat.id, user_id=low_user.id, last_read_seq=0))
         message = Message(
             chat=chat,
+            chat_seq=1,
             sender_user=low_user,
             sender_device=sender,
             client_message_id=uuid.uuid4(),
             envelopes=[
                 MessageEnvelope(
                     recipient_device=recipient,
+                    recipient_user=high_user,
                     mailbox_seq=1,
                     protocol_version=0,
                     envelope_type="PLAINTEXT",
@@ -60,6 +63,8 @@ async def domain_graph(session_factory: async_sessionmaker[AsyncSession]) -> Non
         (Chat, "direct_pair", DirectChatPair),
         (ChatMember, "chat", Chat),
         (ChatMember, "user", User),
+        (ChatMember, "read_state", ChatReadState),
+        (ChatReadState, "member", ChatMember),
         (DirectChatPair, "chat", Chat),
         (DirectChatPair, "user_low", User),
         (DirectChatPair, "user_high", User),
@@ -69,6 +74,7 @@ async def domain_graph(session_factory: async_sessionmaker[AsyncSession]) -> Non
         (Message, "sender_user", User),
         (Message, "sender_device", Device),
         (MessageEnvelope, "recipient_device", Device),
+        (MessageEnvelope, "recipient_user", User),
         (DeviceMailbox, "device", Device),
         (Device, "mailbox", DeviceMailbox),
         (AuthSession, "refresh_token_history", RefreshTokenHistory),

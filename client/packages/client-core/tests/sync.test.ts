@@ -3,7 +3,7 @@ import test from 'node:test'
 import {
   ClientError, MessengerService, SyncManager,
   type CurrentUser, type DisplayMessage, type DurableInbox, type InboxSnapshot, type MailboxEnvelope,
-  type MailboxPage, type MessagingGateway, type OutgoingCommand, type RealtimeGateway, type SendMessageRequest,
+  type MailboxPage, type MessagingGateway, type OutgoingCommand, type RealtimeGateway, type SendMessageRequest, type ChatReadState,
 } from '../src/index.ts'
 
 const user: CurrentUser = { id: 'bob', deviceId: 'device', sessionId: 'session', username: 'bob', status: 'active', createdAt: '2026-09-17T00:00:00Z' }
@@ -631,4 +631,58 @@ test('history decoding rejects a result when the user changes during decode', as
   await manager.activate({ ...user, id: 'other' })
   release()
   await assert.rejects(page, /session changed/)
+})
+
+test('metadata recovery requests only unread pages and restores peer reads after the last page', async () => {
+  const { manager, inbox, api, available } = setup()
+  await manager.activate(user)
+  const calls: unknown[] = []
+  const copied = { ...envelope(1), sender_user_id: user.id, chat_seq: 7 }
+  available([copied])
+  let state: ChatReadState = { chatId: 'chat', ownLocalReadSeq: 0, ownConfirmedReadSeq: 0, peerLastReadSeq: 0 }
+  inbox.readChatReadStates = async () => [state]
+  inbox.mergeChatReadCursor = async (_scope, cursor) => {
+    state = { ...state, peerLastReadSeq: Math.max(state.peerLastReadSeq, cursor.lastReadSeq) }
+    return state
+  }
+  const sent = { ...await api.sendMessage({ chat_id: 'chat', client_message_id: 'unread', envelopes: [] }), id: 'next-id', chatSeq: 8 }
+  inbox.mergeSentMetadata = async (_scope, message) => message
+  api.getSentMessages = async (after, limit, unreadOnly) => {
+    calls.push(['metadata', after, limit, unreadOnly])
+    return after ? { messages: [], hasMore: false, nextMessageId: after }
+      : { messages: [sent], hasMore: true, nextMessageId: sent.id }
+  }
+  api.getChatStates = async () => {
+    calls.push(['reads'])
+    return { states: [{ chatId: 'chat', lastMessageSeq: 8, readStates: [{ chatId: 'chat', userId: 'alice', lastReadSeq: 7, updatedAt: user.createdAt }] }], hasMore: false, nextChatId: 'chat' }
+  }
+  const messenger = new MessengerService(api, {
+    async buildOutgoing() { return [] }, async decodeIncoming() { return 'private' },
+  }, () => 'unused', undefined, manager)
+  const reads: number[] = []
+  messenger.onReadState(value => reads.push(value.peerLastReadSeq))
+  const result = await messenger.loadMailbox()
+  assert.deepEqual(calls, [['metadata', undefined, 100, true], ['metadata', 'next-id', 100, true], ['reads']])
+  assert.equal(reads.at(-1), 7)
+  assert.equal(result.messages[0].chatSeq, 7, 'Read sender copies retain the sequence needed to display read without sent metadata')
+  await messenger.loadMailbox()
+  assert.deepEqual(calls.slice(3), calls.slice(0, 3), 'Each reconnect keeps the unread filter')
+})
+
+test('outgoing recovery skips peer-read messages even when another device has not acknowledged delivery', async () => {
+  const { manager, inbox, api } = setup()
+  await manager.activate(user)
+  const commands = ['read', 'unread', 'pending'].map(id => ({ chat_id: 'chat', client_message_id: id, envelopes: [] }))
+  for (const command of commands) await inbox.putOutgoing(manager.scope(), command)
+  const acceptances = await Promise.all(commands.map(command => api.sendMessage(command)))
+  await inbox.acceptOutgoing(manager.scope(), { ...acceptances[0], chatSeq: 3 })
+  await inbox.acceptOutgoing(manager.scope(), { ...acceptances[1], chatSeq: 4 })
+  inbox.readChatReadStates = async () => [{ chatId: 'chat', ownLocalReadSeq: 0, ownConfirmedReadSeq: 0, peerLastReadSeq: 3 }]
+  const lookups: string[] = []
+  api.findSentMessage = async id => { lookups.push(id); return acceptances.find(item => item.clientMessageId === id)! }
+  const messenger = new MessengerService(api, {
+    async buildOutgoing() { return [] }, async decodeIncoming() { return 'private' },
+  }, () => 'unused', undefined, manager)
+  await messenger.loadMailbox()
+  assert.deepEqual(lookups, ['unread', 'pending'])
 })

@@ -13,7 +13,9 @@ from app.auth.models import Device, User
 from app.auth.schemas import LoginRequest
 from app.auth.security import hash_password
 from app.auth.service import AuthService
-from app.chats.models import Chat, ChatMember, DirectChatPair
+from app.chats.models import Chat, ChatMember, ChatReadState, DirectChatPair
+from app.chats.read_service import ChatReadService
+from app.chats.repository import ChatRepository
 from app.config import Settings
 from app.messages.models import DeviceMailbox, Message, MessageEnvelope
 from app.messages.repository import MessageRepository
@@ -24,27 +26,29 @@ from app.messages.service import MessageService
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
 
-class SynchronizedMessageRepository(MessageRepository):
+class SynchronizedChatRepository(ChatRepository):
     def __init__(self) -> None:
         self.lock_attempts = 0
         self.both_ready = asyncio.Event()
 
-    async def lock_mailboxes(
+    async def lock_chat(
         self,
         session: AsyncSession,
-        device_ids: list[uuid.UUID],
-    ) -> list[DeviceMailbox]:
+        requester_id: uuid.UUID,
+        chat_id: uuid.UUID,
+    ) -> Chat | None:
         self.lock_attempts += 1
         if self.lock_attempts == 2:
             self.both_ready.set()
         await self.both_ready.wait()
-        return await super().lock_mailboxes(session, device_ids)
+        return await super().lock_chat(session, requester_id, chat_id)
 
 
 class PausingDeviceSetRepository(MessageRepository):
     def __init__(self) -> None:
         self.device_set_locked = asyncio.Event()
         self.release = asyncio.Event()
+        self.lock_count = 0
 
     async def lock_device_set(
         self,
@@ -52,8 +56,10 @@ class PausingDeviceSetRepository(MessageRepository):
         user_id: uuid.UUID,
     ) -> bool:
         locked = await super().lock_device_set(session, user_id)
-        self.device_set_locked.set()
-        await self.release.wait()
+        self.lock_count += 1
+        if self.lock_count == 2:
+            self.device_set_locked.set()
+            await self.release.wait()
         return locked
 
 
@@ -176,17 +182,18 @@ async def test_concurrent_sends_keep_sequences_contiguous_and_are_idempotent() -
                         client_message_id=client_message_id or uuid.uuid4(),
                         envelopes=[
                             ClientEnvelopeRequest(
-                                recipient_device_id=bob_device_id,
+                                recipient_device_id=destination_id,
                                 protocol_version=0,
                                 envelope_type="PLAINTEXT",
                                 payload=base64.b64encode(b"concurrent").decode(),
                             )
+                            for destination_id in [bob_device_id, *(item for item in alice_device_ids if item != sender_device_id)]
                         ],
                     ),
                 )
                 return result.message.id
 
-        sequence_service = MessageService(SynchronizedMessageRepository())
+        sequence_service = MessageService(chat_repository=SynchronizedChatRepository())
         message_ids = list(
             await asyncio.gather(
                 *(send_once(sequence_service, item) for item in alice_device_ids)
@@ -199,6 +206,7 @@ async def test_concurrent_sends_keep_sequences_contiguous_and_are_idempotent() -
                     await session.scalars(
                         select(MessageEnvelope.mailbox_seq)
                         .where(MessageEnvelope.message_id.in_(message_ids))
+                        .where(MessageEnvelope.recipient_device_id == bob_device_id)
                         .order_by(MessageEnvelope.mailbox_seq)
                     )
                 ).all()
@@ -208,7 +216,7 @@ async def test_concurrent_sends_keep_sequences_contiguous_and_are_idempotent() -
             assert mailbox is not None
             assert mailbox.last_seq == 2
 
-        idempotency_service = MessageService(SynchronizedMessageRepository())
+        idempotency_service = MessageService(chat_repository=SynchronizedChatRepository())
         shared_client_message_id = uuid.uuid4()
         repeated_ids = list(
             await asyncio.gather(
@@ -232,6 +240,7 @@ async def test_concurrent_sends_keep_sequences_contiguous_and_are_idempotent() -
                         select(MessageEnvelope.mailbox_seq)
                         .join(Message, Message.id == MessageEnvelope.message_id)
                         .where(Message.chat_id == chat_id)
+                        .where(MessageEnvelope.recipient_device_id == bob_device_id)
                         .order_by(MessageEnvelope.mailbox_seq)
                     )
                 ).all()
@@ -241,9 +250,16 @@ async def test_concurrent_sends_keep_sequences_contiguous_and_are_idempotent() -
             assert mailbox is not None
             assert mailbox.last_seq == 3
 
+            chat = await session.get(Chat, chat_id)
+            assert chat is not None and chat.last_message_seq == 3
+            assert list((await session.scalars(
+                select(Message.chat_seq).where(Message.chat_id == chat_id).order_by(Message.chat_seq)
+            )).all()) == [1, 2, 3]
+
             envelope = await session.scalar(
                 select(MessageEnvelope).where(
-                    MessageEnvelope.message_id == repeated_ids[0]
+                    MessageEnvelope.message_id == repeated_ids[0],
+                    MessageEnvelope.recipient_device_id == bob_device_id,
                 )
             )
             assert envelope is not None
@@ -274,7 +290,20 @@ async def test_concurrent_sends_keep_sequences_contiguous_and_are_idempotent() -
             MessageService(), alice_device_ids[0], shared_client_message_id
         )
         assert recovered_id == repeated_ids[0]
+
+        async def advance_once(position: int) -> int:
+            async with session_factory() as session:
+                saved = await ChatReadService(ChatRepository(), MessageRepository()).advance(
+                    session,
+                    Principal(user_id=bob_id, device_id=bob_device_id, session_id=uuid.uuid4()),
+                    chat_id, position,
+                )
+                return saved.last_read_seq
+
+        cursors = await asyncio.gather(*(advance_once(position) for position in (1, 3, 2, 3, 1)))
+        assert max(cursors) == 3
         async with session_factory() as session:
+            assert (await session.get(ChatReadState, (chat_id, bob_id))).last_read_seq == 3
             retained = await session.get(MessageEnvelope, envelope_id)
             assert retained is not None
             assert retained.payload is None

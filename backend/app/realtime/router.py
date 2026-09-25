@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from starlette.requests import HTTPConnection
 
 from app.auth.dependencies import authenticate_access_token
+from app.chats.dependencies import ReadService
 from app.config import get_settings
 from app.database import get_session
 from app.messages.dependencies import Service
@@ -51,6 +52,7 @@ async def receive_event(websocket: WebSocket) -> dict:
 async def websocket_endpoint(
     websocket: WebSocket,
     service: Service,
+    read_service: ReadService,
     sessions: Annotated[object, Depends(session_provider)],
 ) -> None:
     if websocket.headers.get("origin") != str(get_settings().frontend_origin).rstrip("/"):
@@ -97,7 +99,7 @@ async def websocket_endpoint(
             # a current session; they cannot keep a revoked connection alive.
             async with sessions() as session:
                 current = await authenticate_access_token(auth.access_token, session)
-                response = await handle_command(event, session, current, service)
+                response = await handle_command(event, session, current, service, read_service)
             await connection.send(response)
     except HTTPException:
         if connection is not None:

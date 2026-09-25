@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -30,6 +31,9 @@ class Chat(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    last_message_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
     type: Mapped[str] = mapped_column(
         String(16),
         default=DIRECT_CHAT_TYPE,
@@ -62,6 +66,33 @@ class ChatMember(Base):
     )
     chat: Mapped["Chat"] = relationship(back_populates="members", lazy="raise")
     user: Mapped["User"] = relationship(lazy="raise")
+    read_state: Mapped["ChatReadState | None"] = relationship(
+        back_populates="member", lazy="raise", passive_deletes="all"
+    )
+
+
+class ChatReadState(Base):
+    __tablename__ = "chat_read_states"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["chat_id", "user_id"],
+            ["chat_members.chat_id", "chat_members.user_id"],
+            ondelete="CASCADE", name="fk_chat_read_states_member",
+        ),
+        CheckConstraint("last_read_seq >= 0", name="ck_chat_read_states_seq"),
+    )
+
+    chat_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    last_read_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    member: Mapped["ChatMember"] = relationship(
+        back_populates="read_state", lazy="raise"
+    )
 
 
 class DirectChatPair(Base):

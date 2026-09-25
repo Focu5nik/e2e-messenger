@@ -17,11 +17,12 @@ export type Device = {
 }
 
 export type DirectChat = { id: string; type: 'DIRECT'; createdAt: string; otherUser: User }
-export type DestinationDevice = { id: string; protocolVersion: number }
+export type DestinationDevice = { id: string; protocolVersion: number; userId?: string }
 
 export type SentMessage = {
   id: string
   chatId: string
+  chatSeq?: number
   senderUserId: string
   senderDeviceId: string
   clientMessageId: string
@@ -36,6 +37,7 @@ export type ReceivedMessage = {
   envelopeId: string
   messageId: string
   chatId: string
+  chatSeq?: number
   senderUserId: string
   senderDeviceId: string
   clientMessageId: string
@@ -48,12 +50,18 @@ export type DisplayMessage = Pick<
   ReceivedMessage,
   'messageId' | 'chatId' | 'senderUserId' | 'content' | 'createdAt'
 > & {
+  chatSeq?: number
   clientMessageId?: string
   senderDeviceId?: string
   // Immutable local history index tie-breaker.
   historyId?: string
-  status?: 'pending' | 'accepted' | 'delivered'
+  status?: 'pending' | 'accepted' | 'delivered' | 'read'
   deliveries?: Array<{ deviceId: string; deliveredAt: string | null }>
 }
 
-export type MessageDeliveryUpdate = Pick<DisplayMessage, 'messageId' | 'chatId' | 'status' | 'deliveries'>
+export type MessageDeliveryUpdate = Pick<DisplayMessage, 'messageId' | 'chatId' | 'chatSeq' | 'status' | 'deliveries'>
+
+export type ChatReadCursor = { chatId: string; userId: string; lastReadSeq: number; updatedAt: string | null }
+export type ChatReadState = { chatId: string; ownLocalReadSeq: number; ownConfirmedReadSeq: number; peerLastReadSeq: number }
+export type ChatStatesPage = { states: Array<{ chatId: string; lastMessageSeq: number; readStates: ChatReadCursor[] }>; nextChatId: string | null; hasMore: boolean }
+export type SentMessagesPage = { messages: SentMessage[]; nextMessageId: string | null; hasMore: boolean }

@@ -44,3 +44,15 @@ class DeliveryEvent(BaseModel):
     data: DeliveryRequest
 
 
+class ChatReadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chat_id: uuid.UUID
+    last_read_seq: int = Field(ge=0, le=2**53 - 1, strict=True)
+
+
+class ChatReadEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["chat.read"]
+    request_id: str = Field(min_length=1, max_length=128)
+    data: ChatReadRequest
+

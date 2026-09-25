@@ -1,9 +1,10 @@
 import { ClientError } from '../domain/errors.ts'
-import type { DirectChat, DisplayMessage, MessageDeliveryUpdate, ReceivedMessage, SentMessage } from '../domain/models.ts'
+import type { ChatReadState, DirectChat, DisplayMessage, MessageDeliveryUpdate, ReceivedMessage, SentMessage } from '../domain/models.ts'
 import type { ChatHistoryCursor, InboxScope, InboxSnapshot, OutgoingCommand } from '../ports/durableInbox.ts'
 import type { MailboxEnvelope, MessageEnvelope, SendMessageRequest } from '../protocol/contracts.ts'
 import type { MessagingGateway, RealtimeGateway } from '../ports/gateways.ts'
-import type { IdGenerator } from '../ports/platform.ts'
+import { ReadCursorManager } from './readCursorManager.ts'
+import type { IdGenerator, Scheduler } from '../ports/platform.ts'
 import type { MessageCodec } from './messageCodec.ts'
 import type { SyncManager } from './syncManager.ts'
 
@@ -23,6 +24,7 @@ export class MessengerService {
   private readonly createClientMessageId: IdGenerator
   private readonly realtime?: RealtimeGateway
   private readonly sync?: SyncManager
+  private readonly reads?: ReadCursorManager
   private activityHandlers = new Set<(chatIds: string[]) => void>()
   onChatActivity(handler: (chatIds: string[]) => void): () => void {
     this.activityHandlers.add(handler)
@@ -44,12 +46,14 @@ export class MessengerService {
     createClientMessageId: IdGenerator,
     realtime?: RealtimeGateway,
     sync?: SyncManager,
+    scheduler?: Scheduler,
   ) {
     this.api = api
     this.codec = codec
     this.createClientMessageId = createClientMessageId
     this.realtime = realtime
     this.sync = sync
+    if (sync) this.reads = new ReadCursorManager(sync, api, realtime, scheduler)
   }
 
   async sendText(chatId: string, content: string, clientMessageId?: string): Promise<SentMessage> {
@@ -71,7 +75,7 @@ export class MessengerService {
     const scope = this.sync?.scope()
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const destinationDevices = await this.api.getDestinationDevices(chatId)
-      if (destinationDevices.length === 0) {
+      if (destinationDevices.length === 0 || (scope && destinationDevices.every(device => device.userId === scope.userId))) {
         throw new ClientError(
           'This person has no available devices to receive messages. Try again after they register a device.',
           'no_recipient_devices',
@@ -116,6 +120,7 @@ export class MessengerService {
     onError: (error: unknown) => void,
   ): () => void {
     let active = true
+    this.reads?.start()
 
     const reportError = (error: unknown) => {
       if (active) onError(error)
@@ -150,9 +155,13 @@ export class MessengerService {
       if (!this.sync) return
       const scope = this.sync.scope()
       const outgoing = await this.sync.inbox.applyDeliveryReceipt(scope, receipt)
-      if (!active || this.sync.scope() !== scope || !outgoing?.accepted) return
-
-      const accepted = outgoing.accepted
+      if (!active || this.sync.scope() !== scope) return
+      let accepted = outgoing?.accepted ?? await this.sync.inbox.getSentMetadata?.(scope, receipt.message_id)
+      if (!accepted && this.api.getSentMessages) {
+        await this.recoverSentMetadata(scope)
+        accepted = await this.sync.inbox.getSentMetadata?.(scope, receipt.message_id)
+      }
+      if (!accepted || !active || this.sync.scope() !== scope) return
       const update: MessageDeliveryUpdate = {
         messageId: accepted.id,
         chatId: accepted.chatId,
@@ -169,10 +178,42 @@ export class MessengerService {
       void handleDeliveryReceipt(receipt).catch(reportError)
     })
 
+    const unsubscribeRead = this.realtime?.onReadCursor?.(cursor => {
+      void this.reads?.merge(cursor).catch(reportError)
+    })
+
     return () => {
       active = false
+      this.reads?.stop()
+      unsubscribeRead?.()
       unsubscribe?.()
       unsubscribeDelivered?.()
+    }
+  }
+
+  onReadState(handler: (state: ChatReadState) => void): () => void {
+    return this.reads?.onChange(handler) ?? (() => {})
+  }
+
+  advanceReadCursor(chatId: string, seq: number): Promise<void> {
+    return this.reads?.advance(chatId, seq) ?? Promise.resolve()
+  }
+
+  private async recoverSentMetadata(scope: InboxScope): Promise<void> {
+    if (!this.sync?.inbox.mergeSentMetadata || !this.api.getSentMessages) return
+    let after: string | undefined
+    while (true) {
+      const page = await this.api.getSentMessages(after, 100, true)
+      if (this.sync.scope() !== scope) throw new Error('Message session changed.')
+      for (const message of page.messages) {
+        const accepted = await this.sync.inbox.mergeSentMetadata(scope, message)
+        if (this.sync.scope() !== scope) throw new Error('Message session changed.')
+        const update = { messageId: accepted.id, chatId: accepted.chatId, chatSeq: accepted.chatSeq, ...this.deliveryState(accepted) }
+        for (const handler of this.deliveryHandlers) handler(update)
+      }
+      if (!page.hasMore) break
+      if (!page.nextMessageId || page.nextMessageId === after) throw new Error('Sent metadata paging did not advance.')
+      after = page.nextMessageId
     }
   }
 
@@ -184,6 +225,12 @@ export class MessengerService {
     if (this.sync) {
       const scope = this.sync.scope()
       const changes = await this.sync.synchronize()
+      if (this.sync.scope() !== scope) throw new Error('Message session changed.')
+      await this.recoverSentMetadata(scope)
+      if (this.sync.scope() !== scope) throw new Error('Message session changed.')
+      // Fetch read cursors after metadata: messages excluded by a concurrent read
+      // must still acquire their final status, even on a newly registered device.
+      await this.reads?.synchronize()
       if (this.sync.scope() !== scope) throw new Error('Message session changed.')
       await this.recoverOutgoing()
       if (this.sync.scope() !== scope) throw new Error('Message session changed.')
@@ -223,6 +270,7 @@ export class MessengerService {
   async restoreMetadata(): Promise<MailboxLoadResult & { chats: DirectChat[] }> {
     if (!this.sync) return { messages: [], envelopes: [], nextSeq: 0, tombstoneCount: 0, chats: [] }
     const scope = this.sync.scope()
+    await this.reads?.restore()
     const metadata = await this.sync.inbox.readMetadata(scope)
     if (this.sync.scope() !== scope) throw new Error('Message session changed.')
     return { messages: [], envelopes: [], nextSeq: metadata.cursor, tombstoneCount: 0, chats: metadata.chats }
@@ -276,9 +324,12 @@ export class MessengerService {
     const scope = this.sync.scope()
     const operation = async () => {
       const changes = new Map<string, OutgoingCommand>()
+      const readStates = await this.sync!.inbox.readChatReadStates?.(scope) ?? []
+      const peerReads = new Map(readStates.map(state => [state.chatId, state.peerLastReadSeq]))
       for (const outgoing of await this.sync!.inbox.getOutgoingToRecover(scope)) {
         if (this.sync!.scope() !== scope) throw new Error('Message session changed.')
         if (this.inFlight.has(outgoing.command.client_message_id)) continue
+        if (outgoing.accepted?.chatSeq && outgoing.accepted.chatSeq <= (peerReads.get(outgoing.command.chat_id) ?? 0)) continue
         if (outgoing.accepted?.envelopes.length && outgoing.accepted.envelopes.every(item => item.delivered_at)) continue
         try { await this.recoverCommand(outgoing, changes) }
         catch {
@@ -360,17 +411,16 @@ export class MessengerService {
       messageId: accepted?.id ?? `pending:${scope.deviceId}:${command.client_message_id}`,
       clientMessageId: command.client_message_id, senderDeviceId: scope.deviceId,
       historyId: `outgoing:${command.client_message_id}`,
-      chatId: command.chat_id, senderUserId: scope.userId,
+      chatId: command.chat_id, chatSeq: accepted?.chatSeq, senderUserId: scope.userId,
       createdAt: createdAt ?? accepted?.createdAt ?? '',
       content: await this.codec.decodeIncoming(command.envelopes[0]),
-      // Multi-device delivery aggregation is defined by V7. Preserve each receipt.
       ...this.deliveryState(accepted),
     }
   }
 
   private deliveryState(accepted: SentMessage | null): Pick<DisplayMessage, 'status' | 'deliveries'> {
     return {
-      status: !accepted ? 'pending' : accepted.envelopes.length === 1 && accepted.envelopes[0].delivered_at ? 'delivered' : 'accepted',
+      status: !accepted ? 'pending' : accepted.envelopes.some(item => item.recipient_user_id !== accepted.senderUserId && item.delivered_at) ? 'delivered' : 'accepted',
       deliveries: accepted?.envelopes.map(item => ({ deviceId: item.recipient_device_id, deliveredAt: item.delivered_at })),
     }
   }
@@ -392,7 +442,7 @@ export class MessengerService {
     }
   }
 
-  private async decodeEnvelope(envelope: MailboxEnvelope): Promise<ReceivedMessage | null> {
+  private async decodeEnvelope(envelope: MailboxEnvelope): Promise<(ReceivedMessage & Partial<DisplayMessage>) | null> {
     if (envelope.payload === null) return null
     const content = await this.codec.decodeIncoming({
       recipient_device_id: envelope.recipient_device_id,
@@ -400,11 +450,17 @@ export class MessengerService {
       envelope_type: envelope.envelope_type,
       payload: envelope.payload,
     })
+    const scope = this.sync?.scope()
+    const sent = scope && envelope.sender_user_id === scope.userId
+      ? await this.sync!.inbox.getSentMetadata?.(scope, envelope.message_id) : null
     return {
+      ...(scope && envelope.sender_user_id === scope.userId ? this.deliveryState(sent ?? null) : {}),
+      ...(scope && envelope.sender_user_id === scope.userId && !sent ? { status: 'accepted' as const } : {}),
       envelopeId: envelope.id,
       historyId: `envelope:${envelope.id}`,
       messageId: envelope.message_id,
       chatId: envelope.chat_id,
+      chatSeq: envelope.chat_seq,
       senderUserId: envelope.sender_user_id,
       senderDeviceId: envelope.sender_device_id,
       clientMessageId: envelope.client_message_id,

@@ -1,24 +1,11 @@
 import asyncio
 import uuid
-from collections.abc import Callable
 
 from app.messages.models import MessageEnvelope
 from app.messages.responses import envelope_response, mailbox_envelope_response
 from app.messages.types import StoredMessage
 from app.realtime.events import EventBus
-
-
-async def _publish(
-    event_bus: EventBus,
-    device_id: uuid.UUID,
-    make_event: Callable[[], dict],
-) -> None:
-    # The committed database state is authoritative. Clients recover envelopes
-    # and retained receipts when socket delivery fails or times out.
-    try:
-        await asyncio.wait_for(event_bus.publish(device_id, make_event()), timeout=5)
-    except Exception:
-        pass
+from app.realtime.notifications import publish_event
 
 
 async def publish_delivery(
@@ -28,7 +15,7 @@ async def publish_delivery(
 ) -> None:
     if event_bus is None:
         return
-    await _publish(
+    await publish_event(
         event_bus,
         sender_device_id,
         lambda: {
@@ -43,7 +30,7 @@ async def publish_message(event_bus: EventBus | None, stored: StoredMessage) -> 
         return
 
     async def publish(envelope: MessageEnvelope) -> None:
-        await _publish(
+        await publish_event(
             event_bus,
             envelope.recipient_device_id,
             lambda: {

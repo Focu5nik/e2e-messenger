@@ -17,7 +17,12 @@ const preferences = new ChatPreferencesService(browserChatPreferencesStore)
 const sync = new SyncManager(browserDurableInbox, apiClient, realtime)
 apiClient.onSessionCleared(() => sync.deactivate())
 const session = createSessionStore({ session: apiClient, account: apiClient, identities, prepareInbox: (user) => sync.activate(user) })
-const messenger = new MessengerService(apiClient, new PlaintextMessageCodec(browserTextEncoding), browserIdGenerator, realtime, sync)
+const messenger = new MessengerService(apiClient, new PlaintextMessageCodec(browserTextEncoding), browserIdGenerator, realtime, sync, {
+  schedule(callback, delayMs) {
+    const timer = window.setTimeout(callback, delayMs)
+    return () => window.clearTimeout(timer)
+  },
+})
 const chatStore = createChatStore({ chats: apiClient, messenger, preferences })
 
 const client = { session, chatStore, realtime, checkHealth: checkBackendHealth }

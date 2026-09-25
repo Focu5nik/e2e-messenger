@@ -131,6 +131,79 @@ afterEach(async () => {
 })
 after(() => dom.window.close())
 
+test('read reporting requires visible decoded incoming content in the focused active chat', async () => {
+  const { MessageHistory } = await import('../src/features/chats/components/MessageHistory.tsx')
+  let focused = false
+  let visibility = 'visible'
+  const visibilityDescriptor = Object.getOwnPropertyDescriptor(document, 'visibilityState')
+  Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility })
+  mock.method(document, 'hasFocus', () => focused)
+  let visibleSeq = 2
+  const rect = (top: number, height = 20) => ({
+    x: 0, y: top, top, bottom: top + height, left: 0, right: 200, width: 200, height, toJSON() {},
+  })
+  mock.method(dom.window.HTMLElement.prototype, 'getBoundingClientRect', function (this: HTMLElement) {
+    if (this.classList.contains('message-stage')) return rect(0, 200)
+    if (this.dataset.readSeq) return rect(Number(this.dataset.readSeq) === visibleSeq ? 20 : 300)
+    return rect(0, 0)
+  })
+  const advances: number[] = []
+  const messages: DisplayMessage[] = [2, 8].map(chatSeq => ({
+    messageId: `visible-${chatSeq}`, chatId: 'chat', senderUserId: 'bob', chatSeq,
+    content: 'Decoded content', createdAt: user.created_at,
+  }))
+  messages.push({ ...messages[0], messageId: 'legacy', chatSeq: undefined })
+  messages.push({ ...messages[0], messageId: 'sender-copy', senderUserId: user.id, chatSeq: 10 })
+  try {
+    await act(async () => root.render(<MessageHistory messages={messages} userId={user.id}
+      syncError={null} loadPrevious={async () => {}} retryMessage={async () => {}}
+      reportVisible={seq => advances.push(seq)}>Empty</MessageHistory>))
+    assert.deepEqual(advances, [], 'Opening an unfocused chat is not reading')
+    visibility = 'hidden'
+    focused = true
+    await act(async () => window.dispatchEvent(new dom.window.Event('focus')))
+    assert.deepEqual(advances, [], 'A hidden document cannot report reads')
+    visibility = 'visible'
+    await act(async () => document.dispatchEvent(new dom.window.Event('visibilitychange')))
+    assert.deepEqual(advances, [2], 'Overscan and unknown legacy positions must be excluded')
+    assert.equal(container.querySelectorAll('[data-read-seq]').length, 2, 'Sender copies cannot report peer reads')
+    visibleSeq = 8
+    const stage = element('.message-stage')
+    stage.setAttribute('hidden', '')
+    await act(async () => window.dispatchEvent(new dom.window.Event('focus')))
+    assert.deepEqual(advances, [2], 'Account navigation hides the chat without reading it')
+    stage.removeAttribute('hidden')
+    await act(async () => stage.dispatchEvent(new dom.window.Event('scroll')))
+    assert.deepEqual(advances, [2, 8], 'Reading a later visible message covers skipped history')
+    visibleSeq = 2
+    await act(async () => window.dispatchEvent(new dom.window.Event('focus')))
+    assert.deepEqual(advances, [2, 8], 'Repeated visibility cannot regress or repeat the cursor')
+    await act(async () => root.render(null))
+    visibleSeq = 20
+    await act(async () => window.dispatchEvent(new dom.window.Event('focus')))
+    assert.deepEqual(advances, [2, 8], 'Unmounted conversations stop reporting')
+  } finally {
+    if (visibilityDescriptor) Object.defineProperty(document, 'visibilityState', visibilityDescriptor)
+    else Reflect.deleteProperty(document, 'visibilityState')
+  }
+})
+
+test('outgoing status derives Read from the peer cursor and labels accepted messages Sent', async () => {
+  const { MessageRow } = await import('../src/features/chats/components/MessageRow.tsx')
+  const message: DisplayMessage = {
+    messageId: 'status-message', chatId: 'chat', senderUserId: user.id, chatSeq: 4,
+    content: 'Hello', createdAt: user.created_at, status: 'accepted',
+  }
+  const render = (peerLastReadSeq: number) => root.render(<ol><MessageRow message={message}
+    rowKey="status-message" top={0} own sending={false} retrying={false}
+    peerLastReadSeq={peerLastReadSeq} retryMessage={async () => {}} /></ol>)
+  await act(async () => render(3))
+  assert.equal(element('[aria-label="Message status"]').textContent, 'Sent')
+  await act(async () => render(4))
+  assert.equal(element('[aria-label="Message status"]').textContent, 'Read')
+  assert.equal(message.status, 'accepted', 'A cursor update must not rewrite the message')
+})
+
 function element<T extends Element = HTMLElement>(selector: string): T {
   const result = container.querySelector<T>(selector)
   assert.ok(result, `Missing element: ${selector}`)
@@ -194,7 +267,7 @@ test('provider rerenders and account navigation preserve chat state and subscrip
 test('the composer preserves Enter, Shift+Enter and composition handling and scrolls live messages', async () => {
   respond = ({ path }) => {
     if (path === '/chats/bob-chat/destination-devices') {
-      return Response.json([{ id: identity.id, protocol_version: 0 }])
+      return Response.json([{ id: identity.id, user_id: 'bob-id', protocol_version: 0 }])
     }
     if (path === '/messages') return Response.json({ ...sentMessageDto, chat_id: 'bob-chat', sender_user_id: user.id })
   }
@@ -415,7 +488,7 @@ test('no recipient devices shows an actionable error, preserves the draft and al
   }
   respond = ({ path }) => {
     if (path === '/chats/bob-chat/destination-devices') {
-      return Response.json(hasDevice ? [{ id: 'bob-device', protocol_version: 0 }] : [])
+      return Response.json(hasDevice ? [{ id: 'bob-device', user_id: 'bob-id', protocol_version: 0 }] : [])
     }
   }
   await renderApp()
@@ -462,7 +535,7 @@ for (const transport of ['http', 'realtime']) {
     }
     respond = ({ path }) => {
       if (path === '/chats/bob-chat/destination-devices') {
-        return Response.json([{ id: identity.id, protocol_version: 0 }])
+        return Response.json([{ id: identity.id, user_id: 'bob-id', protocol_version: 0 }])
       }
       if (path === '/messages') return failSend ? errorResponse('Send unavailable', 503) : Response.json(sent)
     }

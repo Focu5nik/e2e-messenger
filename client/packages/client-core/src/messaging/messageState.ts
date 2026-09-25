@@ -2,7 +2,7 @@ import type { DisplayMessage } from '../domain/models.ts'
 
 export type MessagesByChat = ReadonlyMap<string, DisplayMessage[]>
 
-const rank = { pending: 0, accepted: 1, delivered: 2 }
+const rank = { pending: 0, accepted: 1, delivered: 2, read: 3 }
 
 function commandKey(message: DisplayMessage): string | undefined {
   return message.clientMessageId && message.senderDeviceId

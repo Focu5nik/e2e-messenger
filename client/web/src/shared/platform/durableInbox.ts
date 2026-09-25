@@ -1,10 +1,10 @@
 import { ClientError, isDeviceIdentity } from '@secure-messenger/client-core'
 import type {
-  DeviceIdentity, DirectChat, DurableDeviceIdentity, DurableInbox, InboxScope,
+  ChatReadCursor, ChatReadState, DeviceIdentity, DirectChat, DurableDeviceIdentity, DurableInbox, InboxScope,
   ChatHistoryCursor, ChatHistoryPage, InboxSnapshot, MailboxEnvelope, MessageEnvelope, OutgoingCommand, SendMessageRequest, SentMessage,
 } from '@secure-messenger/client-core'
 
-const STORES = ['identity', 'envelopes', 'outgoing', 'chats', 'cursors', 'receipts'] as const
+const STORES = ['identity', 'envelopes', 'outgoing', 'chats', 'cursors', 'receipts', 'readStates', 'sentMetadata'] as const
 type StoreName = typeof STORES[number]
 type Stored<T> = { key: string; scope: string; value: T; pending?: string; message?: string[]; history?: string[] }
 
@@ -100,7 +100,7 @@ export class IndexedDBDurableInbox implements DurableInbox {
     if (!this.database) {
       this.database = new Promise<IDBDatabase>((resolve, reject) => {
         const opening = (this.options.indexedDB ?? globalThis.indexedDB).open(
-          this.options.databaseName ?? 'messenger.durable-inbox', 3,
+          this.options.databaseName ?? 'messenger.durable-inbox', 4,
         )
         let blocked = false
         opening.onupgradeneeded = () => {
@@ -261,9 +261,14 @@ export class IndexedDBDurableInbox implements DurableInbox {
 
   async applyDeliveryReceipt(scope: InboxScope, receipt: MessageEnvelope): Promise<OutgoingCommand | null> {
     if (!receipt.delivered_at) throw new Error('Invalid delivery receipt')
-    return this.transaction('readwrite', ['identity', 'outgoing', 'receipts'], async tx => {
+    return this.transaction('readwrite', ['identity', 'outgoing', 'receipts', 'sentMetadata'], async tx => {
       await this.validate(tx, scope)
       const key = scopeKey(scope)
+      const metadataStore = tx.objectStore('sentMetadata')
+      const metadataKey = record(key, receipt.message_id, null).key
+      const metadata = await request(metadataStore.get(metadataKey)) as Stored<SentMessage> | undefined
+      if (metadata) await request(metadataStore.put({ ...metadata, value: { ...metadata.value,
+        envelopes: metadata.value.envelopes.map(item => item.id === receipt.id ? mergeReceipt(item, receipt) : item) } }))
       const store = tx.objectStore('outgoing')
       const entry = await request(store.index('message').get([key, receipt.message_id])) as Stored<OutgoingCommand> | undefined
       if (!entry?.value.accepted) {
@@ -296,6 +301,7 @@ export class IndexedDBDurableInbox implements DurableInbox {
         // Server expiry changes metadata; it must not delete a received local copy.
         entry.value = {
           ...envelope,
+          chat_seq: envelope.chat_seq ?? existing?.value.chat_seq,
           payload: envelope.payload ?? existing?.value.payload ?? null,
           delivered_at: envelope.delivered_at ?? existing?.value.delivered_at ?? null,
           payload_purged_at: envelope.payload_purged_at ?? existing?.value.payload_purged_at ?? null,
@@ -362,10 +368,87 @@ export class IndexedDBDurableInbox implements DurableInbox {
         envelopes.push(mergeReceipt(envelopeWithMetadata, receipt?.value))
         await request(receipts.delete(receiptKey))
       }
-      const accepted: SentMessage = { ...message, envelopes }
+      const accepted: SentMessage = { ...message, chatSeq: message.chatSeq ?? previousAcceptance?.chatSeq, envelopes }
       const value: OutgoingCommand = { ...existing.value, createdAt, accepted }
       await request(store.put(indexedRecord({ ...existing, value })))
       return value
+    })
+  }
+
+  async readChatReadStates(scope: InboxScope): Promise<ChatReadState[]> {
+    return this.transaction('readonly', ['identity', 'readStates'], async tx => {
+      await this.validate(tx, scope)
+      const entries = await request(tx.objectStore('readStates').index('scope').getAll(scopeKey(scope))) as Stored<ChatReadState>[]
+      return entries.map(entry => entry.value)
+    })
+  }
+
+  private async updateReadState(scope: InboxScope, chatId: string, update: (state: ChatReadState) => ChatReadState): Promise<ChatReadState> {
+    return this.transaction('readwrite', ['identity', 'readStates'], async tx => {
+      await this.validate(tx, scope)
+      const store = tx.objectStore('readStates')
+      const entry = record(scopeKey(scope), chatId, null)
+      const prior = await request(store.get(entry.key)) as Stored<ChatReadState> | undefined
+      const value = update(prior?.value ?? { chatId, ownLocalReadSeq: 0, ownConfirmedReadSeq: 0, peerLastReadSeq: 0 })
+      await request(store.put({ ...entry, value }))
+      return value
+    })
+  }
+
+  mergeChatReadCursor(scope: InboxScope, cursor: ChatReadCursor): Promise<ChatReadState> {
+    if (!Number.isSafeInteger(cursor.lastReadSeq) || cursor.lastReadSeq < 0) throw new Error('Invalid read cursor')
+    return this.updateReadState(scope, cursor.chatId, state => cursor.userId === scope.userId
+      ? { ...state, ownLocalReadSeq: Math.max(state.ownLocalReadSeq, cursor.lastReadSeq), ownConfirmedReadSeq: Math.max(state.ownConfirmedReadSeq, cursor.lastReadSeq) }
+      : { ...state, peerLastReadSeq: Math.max(state.peerLastReadSeq, cursor.lastReadSeq) })
+  }
+
+  advanceLocalReadCursor(scope: InboxScope, chatId: string, seq: number): Promise<ChatReadState> {
+    if (!Number.isSafeInteger(seq) || seq < 1) throw new Error('Invalid read cursor')
+    return this.updateReadState(scope, chatId, state => ({ ...state, ownLocalReadSeq: Math.max(state.ownLocalReadSeq, seq) }))
+  }
+
+  async getSentMetadata(scope: InboxScope, messageId: string): Promise<SentMessage | null> {
+    return this.transaction('readonly', ['identity', 'sentMetadata'], async tx => {
+      await this.validate(tx, scope)
+      const entry = await request(tx.objectStore('sentMetadata').get(record(scopeKey(scope), messageId, null).key)) as Stored<SentMessage> | undefined
+      return entry?.value ?? null
+    })
+  }
+
+  async mergeSentMetadata(scope: InboxScope, message: SentMessage): Promise<SentMessage> {
+    return this.transaction('readwrite', ['identity', 'sentMetadata', 'outgoing', 'receipts'], async tx => {
+      await this.validate(tx, scope)
+      if (message.senderUserId !== scope.userId) throw new Error('Metadata belongs to another sender')
+      const key = scopeKey(scope)
+      const store = tx.objectStore('sentMetadata')
+      const entry = record(key, message.id, message)
+      const prior = await request(store.get(entry.key)) as Stored<SentMessage> | undefined
+      const outgoingStore = tx.objectStore('outgoing')
+      const outgoing = await request(outgoingStore.index('message').get([key, message.id])) as Stored<OutgoingCommand> | undefined
+      const envelopes: MessageEnvelope[] = []
+      for (const envelope of message.envelopes) {
+        const receipt = await request(tx.objectStore('receipts').get(record(key, envelope.id, null).key)) as Stored<MessageEnvelope> | undefined
+        envelopes.push({ ...mergeReceipt(mergeDeliveryMetadata(envelope, prior?.value.envelopes.find(item => item.id === envelope.id)
+          ?? outgoing?.value.accepted?.envelopes.find(item => item.id === envelope.id)), receipt?.value), payload: null })
+      }
+      entry.value = { ...message, envelopes }
+      await request(store.put(entry))
+      if (outgoing) await request(outgoingStore.put(indexedRecord({ ...outgoing, value: { ...outgoing.value, accepted: entry.value } })))
+      return entry.value
+    })
+  }
+
+  async needsSequenceBackfill(scope: InboxScope): Promise<boolean> {
+    return this.transaction('readonly', ['identity', 'cursors'], async tx => {
+      await this.validate(tx, scope)
+      return !await request(tx.objectStore('cursors').get(record(scopeKey(scope), 'sequence-backfill-v7', null).key))
+    })
+  }
+
+  async finishSequenceBackfill(scope: InboxScope): Promise<void> {
+    await this.transaction('readwrite', ['identity', 'cursors'], async tx => {
+      await this.validate(tx, scope)
+      await request(tx.objectStore('cursors').put(record(scopeKey(scope), 'sequence-backfill-v7', true)))
     })
   }
 

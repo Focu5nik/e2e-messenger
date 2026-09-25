@@ -20,7 +20,7 @@ test('account and chat mappers produce explicit camelCase models without extra w
   })
   assert.equal(mapDevice({ ...deviceDto, revoked_at: timestamp }).revokedAt, timestamp)
   assert.deepEqual(mapDirectChat(chatDto), { id: 'chat-1', type: 'DIRECT', createdAt: timestamp, otherUser: user })
-  assert.deepEqual(mapDestinationDevice({ id: 'device-1', protocol_version: 0 }), { id: 'device-1', protocolVersion: 0 })
+  assert.deepEqual(mapDestinationDevice({ id: 'device-1', protocol_version: 0, user_id: 'peer-1' }), { id: 'device-1', protocolVersion: 0, userId: 'peer-1' })
   assert.deepEqual(mapList([userDto], mapUser), [user])
   assert.deepEqual(mapList([], mapUser), [])
 })
@@ -31,7 +31,7 @@ test('message mappers preserve envelope wire fields, null payloads, and exact ti
   const tombstone = { ...mailboxEnvelopeDto, payload: null, delivered_at: timestamp, payload_purged_at: timestamp }
   assert.deepEqual(mapMailboxEnvelope(tombstone), tombstone)
   assert.deepEqual(mapSentMessage(sentMessageDto), {
-    id: 'message-1', chatId: 'chat-1', senderUserId: 'user-1', senderDeviceId: 'device-1',
+    id: 'message-1', chatId: 'chat-1', chatSeq: 1, senderUserId: 'user-1', senderDeviceId: 'device-1',
     clientMessageId: 'client-1', createdAt: timestamp, envelopes: [envelopeDto],
   })
   assert.deepEqual(mapMailboxPage(mailboxPageDto), { envelopes: [mailboxEnvelopeDto], nextSeq: 1, hasMore: false })
@@ -43,7 +43,7 @@ test('message mappers preserve envelope wire fields, null payloads, and exact ti
 const shapes: Array<[string, (value: unknown) => unknown, Record<string, unknown>]> = [
   ['user', mapUser, userDto], ['current user', mapCurrentUser, currentUserDto],
   ['device', mapDevice, deviceDto], ['chat', mapDirectChat, chatDto],
-  ['destination device', mapDestinationDevice, { id: 'device-1', protocol_version: 0 }],
+  ['destination device', mapDestinationDevice, { id: 'device-1', protocol_version: 0, user_id: 'peer-1' }],
   ['envelope', mapMessageEnvelope, envelopeDto], ['mailbox envelope', mapMailboxEnvelope, mailboxEnvelopeDto],
   ['sent message', mapSentMessage, sentMessageDto], ['mailbox page', mapMailboxPage, mailboxPageDto],
   ['tokens', mapTokens, tokensDto],

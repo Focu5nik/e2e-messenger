@@ -268,6 +268,98 @@ try {
   }
   results.push('PASS: v1 migration backfills indexed work queues and bounded chat history; early receipts survive reload')
 
+  // V7 metadata backfill replays server tombstones without replacing local content
+  // or treating old delivery receipts as evidence that a message was read.
+  assert((await restored.readChatReadStates(scope)).length === 0, 'Upgrade inferred read state from receipts')
+  const backfill = new SyncManager(restored, {
+    async getMailbox(after) {
+      return { envelopes: after ? [] : [{ ...envelope, chat_seq: 7,
+        recipient_user_id: scope.userId, payload: null, delivered_at: timestamp, payload_purged_at: timestamp }],
+        nextSeq: 1, hasMore: false }
+    },
+    async acknowledgeEnvelope() { throw new Error('Metadata backfill must not ACK an old tombstone') },
+  })
+  await backfill.activate({ ...user, deviceId: scope.deviceId })
+  await backfill.synchronize()
+  const backfilled = await restored.snapshot(scope)
+  assert(backfilled.cursor === 1 && backfilled.envelopes[0].chat_seq === 7, 'V7 backfill lost sequence/cursor')
+  assert(backfilled.envelopes[0].payload === envelope.payload, 'V7 backfill replaced local content')
+  assert((await restored.readChatReadStates(scope)).length === 0, 'Backfill inferred a read cursor')
+  assert(!await restored.needsSequenceBackfill(scope), 'Completed metadata backfill was not durable')
+  results.push('PASS: V7 sequence backfill preserves local content and mailbox position without inferring reads')
+
+  await Promise.all([3, 9, 5].map(seq => restored.advanceLocalReadCursor(scope, 'chat', seq)))
+  await restored.mergeChatReadCursor(scope, { chatId: 'chat', userId: scope.userId, lastReadSeq: 5, updatedAt: timestamp })
+  await restored.mergeChatReadCursor(scope, { chatId: 'chat', userId: 'alice', lastReadSeq: 8, updatedAt: timestamp })
+  const readReload = new IndexedDBDurableInbox({ databaseName })
+  await readReload.mergeChatReadCursor(scope, { chatId: 'chat', userId: 'alice', lastReadSeq: 2, updatedAt: timestamp })
+  let readState = (await readReload.readChatReadStates(scope))[0]
+  assert(readState.ownLocalReadSeq === 9 && readState.ownConfirmedReadSeq === 5 && readState.peerLastReadSeq === 8,
+    'Concurrent advances/reload/stale snapshots regressed cursor state')
+  await readReload.mergeChatReadCursor(scope, { chatId: 'chat', userId: scope.userId, lastReadSeq: 12, updatedAt: timestamp })
+  readState = (await readReload.readChatReadStates(scope))[0]
+  assert(readState.ownLocalReadSeq === 12 && readState.ownConfirmedReadSeq === 12, 'Another device read did not converge')
+  assert(await readReload.readCursor(scope) === 1, 'Reading advanced the mailbox cursor')
+  assert((await readReload.snapshot(scope)).envelopes[0].payload === envelope.payload, 'Reading purged a local payload')
+  assert((await readReload.readChatReadStates({ ...scope, userId: 'other-user' })).length === 0, 'Read states leaked across accounts')
+  await rejects(() => readReload.advanceLocalReadCursor({ ...scope, generation: 'stale' }, 'chat', 99),
+    'Read cursor accepted a stale device generation')
+  results.push('PASS: real IndexedDB cursor advances are atomic, monotonic, scoped, and independent of delivery')
+
+  const senderCopy = { ...accepted, id: 'other-device-message', chatSeq: 13, senderDeviceId: 'other-bob-device',
+    envelopes: [
+      { ...accepted.envelopes[0], id: 'sender-copy', message_id: 'other-device-message', recipient_user_id: scope.userId },
+      { ...accepted.envelopes[0], id: 'peer-copy', message_id: 'other-device-message', recipient_user_id: 'alice',
+        delivered_at: null, payload_purged_at: null },
+    ] }
+  const earlyReceipt = { ...senderCopy.envelopes[1], delivered_at: timestamp, payload_purged_at: timestamp }
+  await readReload.applyDeliveryReceipt(scope, earlyReceipt)
+  await readReload.mergeSentMetadata(scope, senderCopy)
+  await readReload.mergeSentMetadata(scope, senderCopy)
+  const metadata = await new IndexedDBDurableInbox({ databaseName }).getSentMetadata(scope, senderCopy.id)
+  assert(metadata.chatSeq === 13 && metadata.envelopes[1].delivered_at === timestamp,
+    'Sender-copy metadata lost an early receipt or regressed on a stale snapshot')
+  assert(metadata.envelopes.every(item => item.payload === null), 'Sent metadata duplicated payloads')
+  assert((await readReload.snapshot(scope)).outgoing.length === 1, 'Sender metadata created an outgoing command')
+  results.push('PASS: other sender devices recover content-free metadata and early receipts across reload')
+
+  const v3Name = `messenger-v3-upgrade-${crypto.randomUUID()}`
+  const v3 = await new Promise((resolve, reject) => {
+    const opening = indexedDB.open(v3Name, 3)
+    opening.onupgradeneeded = () => {
+      for (const name of ['identity', 'envelopes', 'outgoing', 'chats', 'cursors', 'receipts']) {
+        const store = opening.result.createObjectStore(name, { keyPath: 'key' })
+        if (name !== 'identity') store.createIndex('scope', 'scope')
+        if (name === 'envelopes' || name === 'outgoing') {
+          store.createIndex('pending', 'pending')
+          store.createIndex('history', 'history')
+          if (name === 'outgoing') store.createIndex('message', 'message', { unique: true })
+        }
+      }
+    }
+    opening.onsuccess = () => resolve(opening.result)
+    opening.onerror = () => reject(opening.error)
+  })
+  await new Promise((resolve, reject) => {
+    const tx = v3.transaction(['identity', 'envelopes', 'cursors'], 'readwrite')
+    tx.oncomplete = resolve
+    tx.onabort = () => reject(tx.error)
+    tx.objectStore('identity').put({ key: 'current', value: identity })
+    tx.objectStore('cursors').put({ key: scopeId, scope: scopeId, value: 1 })
+    tx.objectStore('envelopes').put({ ...stored(envelope.id, envelope),
+      pending: scopeId, history: [scopeId, 'chat', timestamp, `envelope:${envelope.id}`] })
+  })
+  v3.close()
+  const fromV3 = new IndexedDBDurableInbox({ databaseName: v3Name })
+  assert((await fromV3.readChatReadStates(scope)).length === 0, 'V3 upgrade inferred reads')
+  assert(await fromV3.needsSequenceBackfill(scope), 'V3 upgrade skipped sequence metadata recovery')
+  await fromV3.commitPage(scope, 1, [{ ...envelope, chat_seq: 7, payload: null,
+    delivered_at: timestamp, payload_purged_at: timestamp }], 1)
+  const v3History = await fromV3.readChatHistory(scope, 'chat', 10)
+  assert(v3History.envelopes.length === 1 && v3History.envelopes[0].chat_seq === 7
+    && v3History.envelopes[0].payload === envelope.payload, 'V3 upgrade lost history/content or sequence enrichment')
+  results.push('PASS: current v3 IndexedDB schema upgrades to v4 with preserved indexed history and no inferred reads')
+
   output.dataset.status = 'passed'
   output.textContent = results.join('\n')
 } catch (error) {

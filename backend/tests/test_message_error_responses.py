@@ -5,15 +5,15 @@ import pytest
 from fastapi import HTTPException
 
 from app.auth.principal import Principal
-from app.messages.router import acknowledge_delivery, destination_devices, send_message
-from app.messages.schemas import ClientEnvelopeRequest, SendMessageRequest
-from app.messages.service import (
-    ChatNotFoundError,
+from app.chats.errors import ChatNotFoundError
+from app.messages.errors import (
     DeliveryTargetsChangedError,
     DuplicateDestinationError,
     EnvelopeNotFoundError,
     InvalidEnvelopeError,
 )
+from app.messages.router import acknowledge_delivery, destination_devices, send_message
+from app.messages.schemas import ClientEnvelopeRequest, SendMessageRequest
 from app.realtime.handlers import handle_delivery, handle_send
 
 

@@ -18,17 +18,17 @@ export const chatDto = {
   id: 'chat-1', type: 'DIRECT', created_at: timestamp, other_user: userDto,
 } satisfies DirectChatDto
 export const envelopeDto = {
-  id: 'envelope-1', message_id: 'message-1', recipient_device_id: 'device-1',
+  id: 'envelope-1', message_id: 'message-1', recipient_device_id: 'device-1', recipient_user_id: 'peer-1',
   mailbox_seq: 1, protocol_version: 0, envelope_type: 'PLAINTEXT', payload: 'aGk=',
   created_at: timestamp, expires_at: '2026-10-22T10:00:00Z',
   delivered_at: null, payload_purged_at: null,
 }
 export const mailboxEnvelopeDto = {
-  ...envelopeDto, chat_id: 'chat-1', sender_user_id: 'user-1', sender_device_id: 'device-1',
+  ...envelopeDto, chat_id: 'chat-1', chat_seq: 1, sender_user_id: 'user-1', sender_device_id: 'device-1',
   client_message_id: 'client-1', message_created_at: timestamp,
 } satisfies MailboxEnvelope
 export const sentMessageDto = {
-  id: 'message-1', chat_id: 'chat-1', sender_user_id: 'user-1', sender_device_id: 'device-1',
+  id: 'message-1', chat_id: 'chat-1', chat_seq: 1, sender_user_id: 'user-1', sender_device_id: 'device-1',
   client_message_id: 'client-1', created_at: timestamp, envelopes: [envelopeDto],
 } satisfies SentMessageDto
 export const mailboxPageDto = {

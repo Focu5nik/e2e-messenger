@@ -2,17 +2,19 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.principal import Principal
+from app.chats.errors import ChatNotFoundError, InvalidReadPositionError
+from app.chats.read_service import ChatReadService
+from app.chats.responses import read_state_response
 from app.messages.error_responses import MessageErrorDescription, describe_message_error
-from app.messages.responses import envelope_response, mailbox_response, message_response
-from app.messages.service import (
-    ChatNotFoundError,
+from app.messages.errors import (
     DeliveryTargetsChangedError,
     DuplicateDestinationError,
     EnvelopeNotFoundError,
     InvalidEnvelopeError,
-    MessageService,
 )
-from app.realtime.schemas import DeliveryEvent, SendEvent, SyncEvent
+from app.messages.responses import envelope_response, mailbox_response, message_response
+from app.messages.service import MessageService
+from app.realtime.schemas import ChatReadEvent, DeliveryEvent, SendEvent, SyncEvent
 
 
 def error_event(code: str, message: str, status: int, request_id=None) -> dict:
@@ -101,10 +103,43 @@ async def handle_send(
     return response
 
 
+async def handle_chat_read(
+    event: dict, session: AsyncSession, principal: Principal, service: ChatReadService
+) -> dict:
+    try:
+        command = ChatReadEvent.model_validate(event)
+        saved = await service.advance(
+            session, principal, command.data.chat_id, command.data.last_read_seq
+        )
+        response = {
+            "type": "chat.read.updated",
+            "request_id": command.request_id,
+            "data": read_state_response(saved).model_dump(mode="json"),
+        }
+    except ValidationError:
+        response = error_event(
+            "invalid_event", "Invalid chat.read data.", 422,
+            event.get("request_id"),
+        )
+    except ChatNotFoundError as exc:
+        response = message_error_event(
+            describe_message_error(exc), event.get("request_id")
+        )
+    except InvalidReadPositionError:
+        response = error_event(
+            "invalid_read_position", "Position does not exist in this chat.", 422,
+            event.get("request_id"),
+        )
+    return response
+
+
 async def handle_command(
-    event: dict, session: AsyncSession, principal: Principal, service: MessageService
+    event: dict, session: AsyncSession, principal: Principal, service: MessageService,
+    read_service: ChatReadService,
 ) -> dict:
     event_type = event.get("type")
+    if event_type == "chat.read":
+        return await handle_chat_read(event, session, principal, read_service)
     if event_type == "sync.request":
         return await handle_sync(event, session, principal, service)
     if event_type == "message.delivered":

@@ -193,7 +193,7 @@ async def test_destination_discovery_and_send_store_one_opaque_envelope_per_devi
     )
     assert destination_response.status_code == 200
     assert destination_response.json() == [
-        {"id": str(device.id), "protocol_version": 0}
+        {"id": str(device.id), "user_id": str(bob.id), "protocol_version": 0}
         for device in sorted(bob_devices, key=lambda item: item.id.int)
     ]
     assert (
@@ -570,6 +570,7 @@ async def test_expiry_purge_is_batched_and_idempotent(
         for index in range(4):
             message = Message(
                 id=uuid.uuid4(),
+                chat_seq=index + 1,
                 chat_id=chat.id,
                 sender_user_id=alice.id,
                 sender_device_id=alice_devices[0].id,
@@ -582,6 +583,7 @@ async def test_expiry_purge_is_batched_and_idempotent(
                     id=uuid.uuid4(),
                     message_id=message.id,
                     recipient_device_id=bob_devices[0].id,
+                    recipient_user_id=bob.id,
                     mailbox_seq=index + 1,
                     protocol_version=0,
                     envelope_type="PLAINTEXT",

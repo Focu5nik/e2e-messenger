@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import uuid
 
 from app.messages.models import Message, MessageEnvelope
 
@@ -7,6 +8,13 @@ from app.messages.models import Message, MessageEnvelope
 class StoredMessage:
     message: Message
     envelopes: list[MessageEnvelope]
+
+
+@dataclass(frozen=True, slots=True)
+class SentMessagesPage:
+    messages: list[StoredMessage]
+    next_message_id: uuid.UUID | None
+    has_more: bool
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,45 +1,17 @@
 import uuid
-from typing import Annotated, TypeAlias
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, HTTPException, Query, status
 
 from app.auth.dependencies import CurrentPrincipal
-from app.auth.models import User
 from app.auth.schemas import UserResponse
-from app.chats.schemas import ChatResponse
-from app.chats.service import (
-    ChatNotFoundError,
-    ChatService,
-    DirectChatView,
-    SelfChatError,
-    TargetUserNotFoundError,
-)
-from app.database import get_session
+from app.chats.dependencies import DatabaseSession, ReadService, Service
+from app.chats.errors import ChatNotFoundError, SelfChatError, TargetUserNotFoundError
+from app.chats.responses import chat_response, chat_states_response, user_response
+from app.chats.schemas import ChatResponse, ChatStatesPageResponse
 
 
 router = APIRouter()
-DatabaseSession: TypeAlias = Annotated[AsyncSession, Depends(get_session)]
-
-
-def chat_service() -> ChatService:
-    return ChatService()
-
-
-Service: TypeAlias = Annotated[ChatService, Depends(chat_service)]
-
-
-def user_response(user: User) -> UserResponse:
-    return UserResponse.model_validate(user)
-
-
-def chat_response(view: DirectChatView) -> ChatResponse:
-    return ChatResponse(
-        id=view.chat.id,
-        type="DIRECT",
-        created_at=view.chat.created_at,
-        other_user=user_response(view.other_user),
-    )
 
 
 @router.get("/users", response_model=list[UserResponse])
@@ -88,6 +60,18 @@ async def list_chats(
 ) -> list[ChatResponse]:
     views = await service.list_direct_chats(session, principal.user_id)
     return [chat_response(view) for view in views]
+
+
+@router.get("/chats/states", response_model=ChatStatesPageResponse)
+async def chat_states(
+    principal: CurrentPrincipal,
+    session: DatabaseSession,
+    service: ReadService,
+    after_chat_id: uuid.UUID | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+) -> ChatStatesPageResponse:
+    page = await service.page(session, principal, after_chat_id, limit)
+    return chat_states_response(page)
 
 
 @router.get("/chats/{chat_id}", response_model=ChatResponse)

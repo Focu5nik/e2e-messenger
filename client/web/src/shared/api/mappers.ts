@@ -1,5 +1,5 @@
 import type {
-  CurrentUser, CurrentUserDto, DestinationDevice, DestinationDeviceDto, Device, DeviceDto,
+  ChatReadCursor, ChatStatesPage, SentMessagesPage, CurrentUser, CurrentUserDto, DestinationDevice, DestinationDeviceDto, Device, DeviceDto,
   DirectChat, DirectChatDto, MailboxEnvelope, MailboxPage, MailboxPageDto,
   MessageEnvelope, SentMessage, SentMessageDto, ServerEvent, TokenResponse, User, UserDto,
 } from '@secure-messenger/client-core'
@@ -98,9 +98,9 @@ export function mapDirectChat(value: unknown): DirectChat {
 export function mapDestinationDevice(value: unknown): DestinationDevice {
   const raw = object(value)
   const dto: DestinationDeviceDto = {
-    id: string(raw.id, 'id'), protocol_version: integer(raw.protocol_version, 'protocol_version'),
+    id: string(raw.id, 'id'), protocol_version: integer(raw.protocol_version, 'protocol_version'), user_id: string(raw.user_id, 'user_id'),
   }
-  return { id: dto.id, protocolVersion: dto.protocol_version }
+  return { id: dto.id, protocolVersion: dto.protocol_version, userId: dto.user_id }
 }
 
 export function mapMessageEnvelope(value: unknown): MessageEnvelope {
@@ -108,6 +108,7 @@ export function mapMessageEnvelope(value: unknown): MessageEnvelope {
   return {
     id: string(dto.id, 'id'), message_id: string(dto.message_id, 'message_id'),
     recipient_device_id: string(dto.recipient_device_id, 'recipient_device_id'),
+    recipient_user_id: string(dto.recipient_user_id, 'recipient_user_id'),
     mailbox_seq: integer(dto.mailbox_seq, 'mailbox_seq'),
     protocol_version: integer(dto.protocol_version, 'protocol_version'),
     envelope_type: string(dto.envelope_type, 'envelope_type'),
@@ -122,7 +123,7 @@ export function mapMessageEnvelope(value: unknown): MessageEnvelope {
 export function mapSentMessage(value: unknown): SentMessage {
   const raw = object(value)
   const dto: SentMessageDto = {
-    id: string(raw.id, 'id'), chat_id: string(raw.chat_id, 'chat_id'),
+    id: string(raw.id, 'id'), chat_id: string(raw.chat_id, 'chat_id'), chat_seq: positiveInteger(raw.chat_seq, 'chat_seq'),
     sender_user_id: string(raw.sender_user_id, 'sender_user_id'),
     sender_device_id: string(raw.sender_device_id, 'sender_device_id'),
     client_message_id: string(raw.client_message_id, 'client_message_id'),
@@ -130,7 +131,7 @@ export function mapSentMessage(value: unknown): SentMessage {
     envelopes: mapList(raw.envelopes, mapMessageEnvelope),
   }
   return {
-    id: dto.id, chatId: dto.chat_id, senderUserId: dto.sender_user_id,
+    id: dto.id, chatId: dto.chat_id, chatSeq: dto.chat_seq, senderUserId: dto.sender_user_id,
     senderDeviceId: dto.sender_device_id, clientMessageId: dto.client_message_id,
     createdAt: dto.created_at, envelopes: dto.envelopes,
   }
@@ -139,7 +140,7 @@ export function mapSentMessage(value: unknown): SentMessage {
 export function mapMailboxEnvelope(value: unknown): MailboxEnvelope {
   const dto = object(value)
   return {
-    ...mapMessageEnvelope(dto), chat_id: string(dto.chat_id, 'chat_id'),
+    ...mapMessageEnvelope(dto), chat_id: string(dto.chat_id, 'chat_id'), chat_seq: positiveInteger(dto.chat_seq, 'chat_seq'),
     sender_user_id: string(dto.sender_user_id, 'sender_user_id'),
     sender_device_id: string(dto.sender_device_id, 'sender_device_id'),
     client_message_id: string(dto.client_message_id, 'client_message_id'),
@@ -196,6 +197,7 @@ export function mapServerEvent(value: unknown):
   | { type: 'sync.response'; request_id: string; data: MailboxPage } {
   const dto = object(value)
   switch (dto.type) {
+    case 'chat.read.updated': return { type: dto.type, request_id: dto.request_id === undefined ? undefined : string(dto.request_id, 'request_id'), data: mapChatReadCursor(dto.data) }
     case 'auth.ok': return { type: dto.type }
     case 'message.new': return { type: dto.type, data: mapMailboxEnvelope(dto.data) }
     case 'message.delivered':
@@ -214,4 +216,30 @@ export function mapServerEvent(value: unknown):
     }
     default: return invalid('event type')
   }
+}
+
+function positiveInteger(value: unknown, field: string): number {
+  const result = integer(value, field)
+  return result > 0 ? result : invalid(field)
+}
+
+export function mapChatReadCursor(value: unknown): ChatReadCursor {
+  const dto = object(value)
+  return { chatId: string(dto.chat_id, 'chat_id'), userId: string(dto.user_id, 'user_id'),
+    lastReadSeq: integer(dto.last_read_seq, 'last_read_seq'), updatedAt: nullableTimestamp(dto.updated_at, 'updated_at') }
+}
+
+export function mapChatStatesPage(value: unknown): ChatStatesPage {
+  const dto = object(value)
+  return { states: mapList(dto.states, value => {
+    const state = object(value)
+    return { chatId: string(state.chat_id, 'chat_id'), lastMessageSeq: integer(state.last_message_seq, 'last_message_seq'),
+      readStates: mapList(state.read_states, mapChatReadCursor) }
+  }), nextChatId: dto.next_chat_id === null ? null : string(dto.next_chat_id, 'next_chat_id'), hasMore: boolean(dto.has_more, 'has_more') }
+}
+
+export function mapSentMessagesPage(value: unknown): SentMessagesPage {
+  const dto = object(value)
+  return { messages: mapList(dto.messages, mapSentMessage), nextMessageId: dto.next_message_id === null ? null : string(dto.next_message_id, 'next_message_id'),
+    hasMore: boolean(dto.has_more, 'has_more') }
 }

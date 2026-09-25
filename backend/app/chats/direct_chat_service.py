@@ -1,5 +1,4 @@
 import uuid
-from dataclasses import dataclass
 
 from sqlalchemy import case, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -7,25 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.auth.models import User
+from app.chats.errors import ChatNotFoundError, SelfChatError, TargetUserNotFoundError
 from app.chats.models import Chat, ChatMember, DirectChatPair
-
-
-class SelfChatError(Exception):
-    pass
-
-
-class ChatNotFoundError(Exception):
-    pass
-
-
-class TargetUserNotFoundError(Exception):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class DirectChatView:
-    chat: Chat
-    other_user: User
+from app.chats.types import DirectChatView
 
 
 def canonical_user_pair(
@@ -38,7 +21,7 @@ def canonical_user_pair(
     return second_user_id, first_user_id
 
 
-class ChatService:
+class DirectChatService:
     async def search_users(
         self,
         session: AsyncSession,

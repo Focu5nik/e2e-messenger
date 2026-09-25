@@ -29,7 +29,7 @@ export type DirectChatDto = {
   other_user: UserDto
 }
 
-export type DestinationDeviceDto = { id: string; protocol_version: number }
+export type DestinationDeviceDto = { id: string; protocol_version: number; user_id?: string }
 
 export type ClientEnvelope = {
   recipient_device_id: string
@@ -47,6 +47,7 @@ export type SendMessageRequest = {
 export type MessageEnvelope = Omit<ClientEnvelope, 'payload'> & {
   id: string
   message_id: string
+  recipient_user_id?: string
   mailbox_seq: number
   payload: string | null
   created_at: string
@@ -58,6 +59,7 @@ export type MessageEnvelope = Omit<ClientEnvelope, 'payload'> & {
 export type SentMessageDto = {
   id: string
   chat_id: string
+  chat_seq?: number
   sender_user_id: string
   sender_device_id: string
   client_message_id: string
@@ -67,6 +69,7 @@ export type SentMessageDto = {
 
 export type MailboxEnvelope = MessageEnvelope & {
   chat_id: string
+  chat_seq?: number
   sender_user_id: string
   sender_device_id: string
   client_message_id: string
@@ -76,6 +79,7 @@ export type MailboxEnvelope = MessageEnvelope & {
 export type MailboxPageDto = { envelopes: MailboxEnvelope[]; next_seq: number; has_more: boolean }
 
 export type ServerEvent =
+  | { type: 'chat.read.updated'; request_id?: string; data: { chatId: string; userId: string; lastReadSeq: number; updatedAt: string | null } }
   | { type: 'message.delivered'; request_id?: string; data: MessageEnvelope }
   | { type: 'auth.ok' }
   | { type: 'message.new'; data: MailboxEnvelope }
@@ -84,6 +88,7 @@ export type ServerEvent =
   | { type: 'error'; request_id?: string; error: { code: string; message: string; status: number } }
 
 export type ClientEvent =
+  | { type: 'chat.read'; request_id: string; data: { chat_id: string; last_read_seq: number } }
   | { type: 'message.delivered'; request_id: string; data: { envelope_id: string } }
   | { type: 'auth'; access_token: string }
   | { type: 'message.send'; request_id: string; data: SendMessageRequest }

@@ -1,19 +1,23 @@
 import type { ChatHistoryState, DisplayMessage } from '@secure-messenger/client-core'
 import { useState, type ReactNode } from 'react'
 import { useMessageVirtualization } from '../hooks/useMessageVirtualization'
+import { useMessageVisibility } from '../hooks/useMessageVisibility'
 import { MessageRow } from './MessageRow'
 
-export function MessageHistory({ messages, userId, history, syncError, sending = false, loadPrevious, retryMessage, children }: {
+export function MessageHistory({ messages, userId, history, syncError, sending = false, peerLastReadSeq = 0, reportVisible, loadPrevious, retryMessage, children }: {
   messages: DisplayMessage[]
   userId: string
   history?: ChatHistoryState
   syncError: string | null
   sending?: boolean
+  peerLastReadSeq?: number
+  reportVisible?(lastReadSeq: number): void
   loadPrevious(): Promise<void>
   retryMessage(id: string): Promise<void>
   children: ReactNode
 }) {
   const { stage, list, total, visible, capture, stopFollowingBottom } = useMessageVirtualization(messages, userId)
+  useMessageVisibility(stage, reportVisible)
   const [retrying, setRetrying] = useState<ReadonlySet<string>>(new Set())
 
   async function retry(id: string) {
@@ -57,7 +61,7 @@ export function MessageHistory({ messages, userId, history, syncError, sending =
       <ol ref={list} className="message-list" aria-label="Messages"
         style={{ position: 'relative', height: total, flex: '0 0 auto', display: 'block' }}>
         {visible.map(({ message, key, top }) => <MessageRow key={key} rowKey={key} message={message}
-          top={top} own={message.senderUserId === userId} sending={sending}
+          top={top} own={message.senderUserId === userId} sending={sending} peerLastReadSeq={peerLastReadSeq}
           retrying={!!message.clientMessageId && retrying.has(message.clientMessageId)} retryMessage={retry} />)}
       </ol>}
   </div>

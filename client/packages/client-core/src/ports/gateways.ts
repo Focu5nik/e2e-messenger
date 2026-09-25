@@ -1,6 +1,6 @@
 import type {
   CurrentUser, DestinationDevice, Device, DirectChat, LoginDevice, MailboxPage,
-  SentMessage, User,
+  SentMessage, User, ChatReadCursor, ChatStatesPage, SentMessagesPage,
 } from '../domain/models.ts'
 import type { MailboxEnvelope, MessageEnvelope, SendMessageRequest } from '../protocol/contracts.ts'
 
@@ -30,6 +30,8 @@ export interface ChatGateway {
 }
 
 export interface MessagingGateway {
+  getChatStates?(afterChatId?: string, limit?: number): Promise<ChatStatesPage>
+  getSentMessages?(afterMessageId?: string, limit?: number, unreadOnly?: boolean): Promise<SentMessagesPage>
   acknowledgeEnvelope?(envelopeId: string): Promise<MessageEnvelope>
   findSentMessage?(clientMessageId: string): Promise<SentMessage | null>
   getDestinationDevices(chatId: string): Promise<DestinationDevice[]>
@@ -38,6 +40,8 @@ export interface MessagingGateway {
 }
 
 export interface RealtimeGateway {
+  advanceReadCursor?(chatId: string, lastReadSeq: number): Promise<ChatReadCursor>
+  onReadCursor?(handler: (cursor: ChatReadCursor) => void): () => void
   acknowledgeEnvelope?(envelopeId: string): Promise<MessageEnvelope>
   onDelivered?(handler: (envelope: MessageEnvelope) => void): () => void
   readonly ready: boolean

@@ -39,6 +39,7 @@ export class SyncManager {
     const scope = this.scope()
     return this.enqueue(async () => {
       const changes = new Map<string, MailboxEnvelope>()
+      await this.backfillSequences(scope, changes)
       await this.acknowledgePending(scope, changes)
       await this.pageMailbox(scope, changes)
       return { cursor: await this.inbox.readCursor(scope), envelopes: [...changes.values()] }
@@ -65,6 +66,24 @@ export class SyncManager {
       await this.acknowledgePending(scope, changes)
       return { cursor: await this.inbox.readCursor(scope), envelopes: [...changes.values()] }
     })
+  }
+
+  private async backfillSequences(scope: InboxScope, changes: Map<string, MailboxEnvelope>): Promise<void> {
+    if (!await this.inbox.needsSequenceBackfill?.(scope)) return
+    const through = await this.inbox.readCursor(scope)
+    let after = 0
+    while (after < through) {
+      this.assertCurrent(scope)
+      const page = await this.api.getMailbox(after, 100)
+      this.assertCurrent(scope)
+      this.validatePage(scope, after, page)
+      const cursor = await this.inbox.readCursor(scope)
+      this.collect(changes, await this.inbox.commitPage(scope, cursor, page.envelopes, Math.max(cursor, page.nextSeq)))
+      after = page.nextSeq
+      if (!page.hasMore) break
+    }
+    this.assertCurrent(scope)
+    await this.inbox.finishSequenceBackfill?.(scope)
   }
 
   private async pageMailbox(scope: InboxScope, changes: Map<string, MailboxEnvelope>): Promise<void> {

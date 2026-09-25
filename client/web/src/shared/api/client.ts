@@ -1,10 +1,10 @@
 import type {
-  AccountGateway, ChatGateway, MessagingGateway, SessionGateway,
+  ChatStatesPage, SentMessagesPage, AccountGateway, ChatGateway, MessagingGateway, SessionGateway,
   CredentialsRequest, CurrentUser, DestinationDevice, Device, DirectChat, LoginDevice,
   LoginRequest, MailboxPage, MessageEnvelope, SendMessageRequest, SentMessage, TokenResponse, User,
 } from '@secure-messenger/client-core'
 import {
-  mapCurrentUser, mapDestinationDevice, mapDevice, mapDirectChat, mapEmpty, mapError,
+  mapChatStatesPage, mapSentMessagesPage, mapCurrentUser, mapDestinationDevice, mapDevice, mapDirectChat, mapEmpty, mapError,
   mapList, mapMailboxPage, mapMessageEnvelope, mapSentMessage, mapTokens, mapUser,
 } from './mappers.ts'
 import { ApiError } from './errors.ts'
@@ -187,6 +187,19 @@ export class ApiClient implements SessionGateway, AccountGateway, ChatGateway, M
       if (error instanceof ApiError && error.status === 404) return null
       throw error
     }
+  }
+
+  getChatStates(afterChatId?: string, limit = 100): Promise<ChatStatesPage> {
+    const query = new URLSearchParams({ limit: String(limit) })
+    if (afterChatId) query.set('after_chat_id', afterChatId)
+    return this.authenticatedRequest(mapChatStatesPage, `/chats/states?${query.toString()}`)
+  }
+
+  getSentMessages(afterMessageId?: string, limit = 100, unreadOnly = false): Promise<SentMessagesPage> {
+    const query = new URLSearchParams({ limit: String(limit) })
+    if (afterMessageId) query.set('after_message_id', afterMessageId)
+    if (unreadOnly) query.set('unread_only', 'true')
+    return this.authenticatedRequest(mapSentMessagesPage, `/messages/sent?${query.toString()}`)
   }
 
   getMailbox(afterSeq: number, limit = 100): Promise<MailboxPage> {

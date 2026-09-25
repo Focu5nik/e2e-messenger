@@ -8,14 +8,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.auth.models import User
+from app.chats.direct_chat_service import DirectChatService
 from app.chats.models import Chat, ChatMember, DirectChatPair
-from app.chats.service import ChatService, DirectChatView
+from app.chats.types import DirectChatView
 
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
 
-class SynchronizedChatService(ChatService):
+class SynchronizedChatService(DirectChatService):
     def __init__(self) -> None:
         self.initial_lookups = 0
         self.both_looked_up = asyncio.Event()
@@ -46,7 +47,7 @@ async def test_direct_chat_rejects_third_member() -> None:
     assert TEST_DATABASE_URL is not None
     engine = create_async_engine(TEST_DATABASE_URL)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    service = ChatService()
+    service = DirectChatService()
     first_id = uuid.uuid4()
     second_id = uuid.uuid4()
     outsider_id = uuid.uuid4()

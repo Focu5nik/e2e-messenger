@@ -56,6 +56,23 @@ function tokenResponse(accessToken: string): Response {
 
 const { ApiClient } = await import('../src/shared/api/client.ts')
 
+test('sent metadata requests preserve paging and explicitly filter messages already read by the peer', async () => {
+  const queries: string[] = []
+  globalThis.fetch = async input => {
+    const url = new URL(String(input))
+    if (url.pathname === '/auth/login') return tokenResponse('access-token')
+    assert.equal(url.pathname, '/messages/sent')
+    queries.push(url.search)
+    return Response.json({ messages: [], next_message_id: null, has_more: false })
+  }
+  const client = new ApiClient()
+  await client.login('alice', 'password', { id: 'device', name: 'Browser' })
+  await client.getSentMessages(undefined, 100, true)
+  await client.getSentMessages('next-id', 50, true)
+  await client.getSentMessages()
+  assert.deepEqual(queries, ['?limit=100&unread_only=true', '?limit=50&after_message_id=next-id&unread_only=true', '?limit=100'])
+})
+
 test('V6 HTTP acknowledgements and acceptance recovery validate responses and distinguish absence from failure', async () => {
   const receipt = { ...envelopeDto, payload: null, delivered_at: timestamp, payload_purged_at: timestamp }
   let status = 200
@@ -263,11 +280,12 @@ test('messaging methods use the V3 device, send, and mailbox contracts', async (
     requests.push({ init, url })
     if (url.endsWith('/auth/login')) return tokenResponse('v3-access-token')
     if (url.endsWith('/chats/chat%2Fid/destination-devices')) {
-      return Response.json([{ id: 'device/id', protocol_version: 0 }])
+      return Response.json([{ id: 'device/id', protocol_version: 0, user_id: 'peer/id' }])
     }
     if (url.endsWith('/messages')) {
       return Response.json({
         id: 'message-id',
+        chat_seq: 1,
         chat_id: 'chat/id',
         sender_user_id: 'user-id',
         sender_device_id: 'sender-device-id',
@@ -286,10 +304,10 @@ test('messaging methods use the V3 device, send, and mailbox contracts', async (
   await client.login('alice', 'correct horse', { id: 'device-id', name: 'Browser' })
 
   assert.deepEqual(await client.getDestinationDevices('chat/id'), [
-    { id: 'device/id', protocolVersion: 0 },
+    { id: 'device/id', protocolVersion: 0, userId: 'peer/id' },
   ])
   assert.deepEqual(await client.sendMessage(command), {
-    id: 'message-id', chatId: 'chat/id', senderUserId: 'user-id', senderDeviceId: 'sender-device-id',
+    id: 'message-id', chatId: 'chat/id', chatSeq: 1, senderUserId: 'user-id', senderDeviceId: 'sender-device-id',
     clientMessageId: command.client_message_id, createdAt: '2026-09-07T00:00:00Z', envelopes: [],
   })
   assert.deepEqual(await client.getMailbox(41, 25), {

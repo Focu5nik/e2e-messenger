@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
-from app.messages.service import (
-    ChatNotFoundError,
+from app.chats.errors import ChatNotFoundError
+from app.messages.errors import (
     DeliveryTargetsChangedError,
     DuplicateDestinationError,
     EnvelopeNotFoundError,

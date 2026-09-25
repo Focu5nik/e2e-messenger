@@ -21,6 +21,9 @@ export function ChatConversation({ user }: { user: CurrentUser }) {
   const mailboxError = useChatStore((state) => state.mailboxError)
   const sending = useChatStore((state) => state.sending || state.loadingMailbox)
   const retryMessage = useChatStore((state) => state.retryMessage)
+  const peerLastReadSeq = useChatStore(state => state.selectedChat
+    ? state.readStatesByChat.get(state.selectedChat.id)?.peerLastReadSeq ?? 0 : 0)
+  const reportVisibleMessages = useChatStore(state => state.reportVisibleMessages)
   const [draft, setDraft] = useState('')
   return (
     <section className="chat-stage" aria-labelledby="selected-chat-heading">
@@ -37,7 +40,8 @@ export function ChatConversation({ user }: { user: CurrentUser }) {
             <span className="secure-pill">Private</span>
           </header>
           <MessageHistory key={selectedChat.id} messages={selectedMessages} userId={user.id} sending={sending}
-            history={history} syncError={mailboxError} loadPrevious={loadPrevious} retryMessage={retryMessage}>
+            history={history} syncError={mailboxError} loadPrevious={loadPrevious} retryMessage={retryMessage}
+            peerLastReadSeq={peerLastReadSeq} reportVisible={seq => reportVisibleMessages(selectedChat.id, seq)}>
             <div className="chat-empty-state message-empty">
               <div className="empty-lock" aria-hidden="true">S</div>
               <h3>No messages yet</h3>

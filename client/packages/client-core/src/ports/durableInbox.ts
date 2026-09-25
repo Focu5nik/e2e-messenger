@@ -1,4 +1,4 @@
-import type { DeviceIdentity, DirectChat, SentMessage } from '../domain/models.ts'
+import type { ChatReadCursor, ChatReadState, DeviceIdentity, DirectChat, SentMessage } from '../domain/models.ts'
 import type { MailboxEnvelope, MessageEnvelope, SendMessageRequest } from '../protocol/contracts.ts'
 import type { DeviceIdentityStore } from './platform.ts'
 
@@ -22,6 +22,14 @@ export type ChatHistoryPage = {
 // Implementations must reject stale generations and resolve writes only after commit.
 // Store opaque envelope bytes, never decoded private message content.
 export interface DurableInbox extends DeviceIdentityStore {
+  readChatReadStates?(scope: InboxScope): Promise<ChatReadState[]>
+  mergeChatReadCursor?(scope: InboxScope, cursor: ChatReadCursor): Promise<ChatReadState>
+  advanceLocalReadCursor?(scope: InboxScope, chatId: string, seq: number): Promise<ChatReadState>
+  mergeSentMetadata?(scope: InboxScope, message: SentMessage): Promise<SentMessage>
+  getSentMetadata?(scope: InboxScope, messageId: string): Promise<SentMessage | null>
+  needsSequenceBackfill?(scope: InboxScope): Promise<boolean>
+  finishSequenceBackfill?(scope: InboxScope): Promise<void>
+
   read(): Promise<DurableDeviceIdentity | null>
   readMetadata(scope: InboxScope): Promise<{ cursor: number; chats: DirectChat[] }>
   // Full export for diagnostics; ordinary operations use indexed reads.

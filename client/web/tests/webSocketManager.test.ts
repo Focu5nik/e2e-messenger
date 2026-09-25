@@ -135,7 +135,7 @@ test('authenticates in the first frame and routes only authenticated events and 
   socket.receive({ type: 'message.accepted', request_id: frame.request_id, data: { id: 'malformed' } })
   socket.receive({ type: 'message.accepted', request_id: frame.request_id, data: sentMessageDto })
   assert.deepEqual(await sending, {
-    id: 'message-1', chatId: 'chat-1', senderUserId: 'user-1', senderDeviceId: 'device-1',
+    id: 'message-1', chatId: 'chat-1', chatSeq: 1, senderUserId: 'user-1', senderDeviceId: 'device-1',
     clientMessageId: 'client-1', createdAt: timestamp, envelopes: sentMessageDto.envelopes,
   })
   manager.stop()

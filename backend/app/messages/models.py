@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (
+        Index("ix_messages_sender_user_id_id", "sender_user_id", "id"),
+        UniqueConstraint("chat_id", "chat_seq", name="uq_messages_chat_seq"),
+        CheckConstraint("chat_seq > 0", name="ck_messages_chat_seq_positive"),
         UniqueConstraint(
             "sender_device_id",
             "client_message_id",
@@ -45,6 +48,7 @@ class Message(Base):
         ForeignKey("devices.id", ondelete="RESTRICT"), nullable=False
     )
     client_message_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    chat_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -106,6 +110,9 @@ class MessageEnvelope(Base):
     recipient_device_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("devices.id", ondelete="RESTRICT"), nullable=False
     )
+    recipient_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
     mailbox_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
     protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
     envelope_type: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -124,3 +131,4 @@ class MessageEnvelope(Base):
         back_populates="envelopes", lazy="raise"
     )
     recipient_device: Mapped["Device"] = relationship(lazy="raise")
+    recipient_user: Mapped["User"] = relationship(lazy="raise")

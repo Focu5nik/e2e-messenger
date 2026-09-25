@@ -41,12 +41,12 @@ This inventory is checked against TypeScript's resolved entry-point exports by
 | Runtime: preferences | `ChatPreferencesService` |
 | Runtime: stores | `createSessionStore`, `createChatStore` |
 | Runtime: messaging | `MessengerService`, `PlaintextMessageCodec`, `SyncManager`, `mergeMessages` |
-| Types: domain | `User`, `CurrentUser`, `DeviceIdentity`, `LoginDevice`, `Device`, `DirectChat`, `DestinationDevice`, `SentMessage`, `MailboxPage`, `ReceivedMessage`, `DisplayMessage`, `MessageDeliveryUpdate` |
+| Types: domain | `User`, `CurrentUser`, `DeviceIdentity`, `LoginDevice`, `Device`, `DirectChat`, `DestinationDevice`, `SentMessage`, `MailboxPage`, `ReceivedMessage`, `DisplayMessage`, `MessageDeliveryUpdate`, `ChatReadCursor`, `ChatReadState`, `ChatStatesPage`, `SentMessagesPage` |
 | Types: errors | `ClientErrorCode` |
 | Types: HTTP protocol | `CredentialsRequest`, `LoginRequest`, `TokenResponse`, `UserDto`, `CurrentUserDto`, `DeviceDto`, `DirectChatDto`, `DestinationDeviceDto`, `SentMessageDto`, `MailboxPageDto` |
 | Types: message / realtime protocol | `ClientEnvelope`, `SendMessageRequest`, `MessageEnvelope`, `MailboxEnvelope`, `ServerEvent`, `ClientEvent` |
 | Types: gateways | `SessionGateway`, `AccountGateway`, `ChatGateway`, `MessagingGateway`, `RealtimeGateway` |
-| Types: platform ports | `DeviceIdentityStore`, `ChatPreferencesStore`, `DeviceDescription`, `IdGenerator`, `TextEncoding` |
+| Types: platform ports | `DeviceIdentityStore`, `ChatPreferencesStore`, `DeviceDescription`, `IdGenerator`, `TextEncoding`, `Scheduler` |
 | Types: durable inbox | `DurableDeviceIdentity`, `DurableInbox`, `InboxScope`, `InboxSnapshot`, `ChatHistoryCursor`, `ChatHistoryPage`, `OutgoingCommand` |
 | Types: session store | `SessionState`, `SessionStore`, `SessionStoreDependencies` |
 | Types: chat store | `ChatHistoryState`, `ChatState`, `ChatStore`, `ChatStoreDependencies` |
@@ -93,7 +93,7 @@ each port below, then construct the same services and vanilla stores.
 | `ChatPreferencesStore` | Asynchronously read/write the last chat ID per user. Null removes the preference. Await writes and propagate failures; core owns stale-chat cleanup and operation ordering. |
 | `DeviceDescription` | Asynchronously provide a nonblank device name of at most 100 characters without browser globals. |
 | `IdGenerator` | Use a platform-supported UUID generator for device/client message IDs. Do not implement custom randomness or cryptography. |
-| `TextEncoding` | Implement UTF-8 and Base64 byte conversions; reject malformed UTF-8/Base64. Preserve Unicode and empty payload behavior. |
+| `TextEncoding`, `Scheduler` | Implement UTF-8 and Base64 byte conversions; reject malformed UTF-8/Base64. Preserve Unicode and empty payload behavior. |
 
 Create DeviceIdentityService using the durable inbox and ChatPreferencesService
 using the preference port. Inject that same inbox into SyncManager and pass the

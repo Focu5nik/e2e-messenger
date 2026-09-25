@@ -1,4 +1,4 @@
-import type { ClientEvent, MailboxEnvelope, MailboxPage, MessageEnvelope, RealtimeGateway, SendMessageRequest, SentMessage } from '@secure-messenger/client-core'
+import type { ChatReadCursor, ClientEvent, MailboxEnvelope, MailboxPage, MessageEnvelope, RealtimeGateway, SendMessageRequest, SentMessage } from '@secure-messenger/client-core'
 import { mapServerEvent } from './mappers.ts'
 import { ApiError } from './errors.ts'
 
@@ -28,6 +28,8 @@ export class WebSocketManager implements RealtimeGateway {
   private messageHandlers = new Set<(envelope: MailboxEnvelope) => void>()
   private deliveredHandlers = new Set<(envelope: MessageEnvelope) => void>()
   private pendingAck = new Map<string, PendingRequest<MessageEnvelope>>()
+  private readHandlers = new Set<(cursor: ChatReadCursor) => void>()
+  private pendingRead = new Map<string, PendingRequest<ChatReadCursor>>()
   private readyHandlers = new Set<() => void>()
   private pending = new Map<string, PendingRequest<SentMessage>>()
   private pendingSync = new Map<string, PendingRequest<MailboxPage>>()
@@ -77,6 +79,18 @@ export class WebSocketManager implements RealtimeGateway {
   onDelivered(handler: (envelope: MessageEnvelope) => void): () => void {
     this.deliveredHandlers.add(handler)
     return () => { this.deliveredHandlers.delete(handler) }
+  }
+
+  onReadCursor(handler: (cursor: ChatReadCursor) => void): () => void {
+    this.readHandlers.add(handler)
+    return () => { this.readHandlers.delete(handler) }
+  }
+
+  advanceReadCursor(chatId: string, lastReadSeq: number): Promise<ChatReadCursor> {
+    return this.request(this.pendingRead,
+      requestId => ({ type: 'chat.read', request_id: requestId, data: { chat_id: chatId, last_read_seq: lastReadSeq } }),
+      () => new ApiError('Read confirmation timed out.', 0),
+      () => new ApiError('Connection lost during read confirmation.', 0))
   }
 
   acknowledgeEnvelope(envelopeId: string): Promise<MessageEnvelope> {
@@ -183,6 +197,11 @@ export class WebSocketManager implements RealtimeGateway {
     if (!this.authenticated) return
 
     switch (frame.type) {
+      case 'chat.read.updated':
+        if (frame.request_id) this.takePending(this.pendingRead, frame.request_id)?.resolve(frame.data)
+        else for (const handler of this.readHandlers) handler(frame.data)
+        return
+
       case 'message.new':
         for (const handler of this.messageHandlers) handler(frame.data)
         return
@@ -204,7 +223,8 @@ export class WebSocketManager implements RealtimeGateway {
         return
 
       case 'error': {
-        const pending = this.takePending(this.pendingAck, frame.request_id)
+        const pending = this.takePending(this.pendingRead, frame.request_id)
+          ?? this.takePending(this.pendingAck, frame.request_id)
           ?? this.takePending(this.pendingSync, frame.request_id)
           ?? this.takePending(this.pending, frame.request_id)
         if (!pending) return
@@ -238,6 +258,11 @@ export class WebSocketManager implements RealtimeGateway {
   }
 
   private rejectPending(): void {
+    for (const pending of this.pendingRead.values()) {
+      window.clearTimeout(pending.timer)
+      pending.reject(new ApiError('Connection lost during read confirmation.', 0))
+    }
+    this.pendingRead.clear()
     for (const pending of this.pendingAck.values()) {
       window.clearTimeout(pending.timer)
       pending.reject(new ApiError('Connection lost during delivery acknowledgment.', 0))
