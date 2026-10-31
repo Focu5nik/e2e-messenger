@@ -11,6 +11,13 @@ class Settings(BaseSettings):
     jwt_secret: SecretStr = Field(min_length=32)
     access_token_ttl_minutes: int = Field(default=15, ge=1, le=60)
     refresh_token_ttl_days: int = Field(default=30, ge=1, le=365)
+    redis_url: SecretStr | None = None
+    redis_channel: str = Field(default="messenger:events", min_length=1)
+
+    @field_validator("redis_url", mode="before")
+    @classmethod
+    def empty_redis_url(cls, value: str | SecretStr | None) -> str | SecretStr | None:
+        return None if value == "" else value
 
     @field_validator("frontend_origin")
     @classmethod

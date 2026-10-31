@@ -1,7 +1,11 @@
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,10 +16,36 @@ from app.config import get_settings
 from app.database import get_session
 from app.messages.router import router as messages_router
 from app.realtime.events import ConnectionRegistry, InMemoryEventBus
+from app.realtime.redis_events import RedisEventBus
 from app.realtime.router import router as realtime_router
 
 settings = get_settings()
-api = FastAPI(title="Secure Messenger API", version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    config = get_settings()
+    registry = application.state.connection_registry
+    if config.redis_url is None:
+        application.state.event_bus = InMemoryEventBus(registry)
+        yield
+        return
+    redis = Redis.from_url(
+        config.redis_url.get_secret_value(),
+        socket_connect_timeout=5,
+        socket_timeout=5,
+        retry=Retry(NoBackoff(), 0),
+    )
+    bus = RedisEventBus(registry, redis, config.redis_channel)
+    application.state.event_bus = bus
+    try:
+        await bus.start()
+        yield
+    finally:
+        await bus.stop()
+
+
+api = FastAPI(title="Secure Messenger API", version="0.1.0", lifespan=lifespan)
 api.state.connection_registry = ConnectionRegistry()
 api.state.event_bus = InMemoryEventBus(api.state.connection_registry)
 

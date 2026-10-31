@@ -43,6 +43,9 @@ class ConnectionRegistry:
     def is_current(self, device_id: uuid.UUID, connection: Connection) -> bool:
         return self._connections.get(device_id) is connection
 
+    def is_connected(self, device_id: uuid.UUID) -> bool:
+        return device_id in self._connections
+
     def unregister(self, device_id: uuid.UUID, connection: Connection) -> None:
         if self.is_current(device_id, connection):
             del self._connections[device_id]

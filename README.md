@@ -42,6 +42,29 @@ PostgreSQL continues to use port `5432` inside the container. Override
 Direct Docker commands use `docker compose --env-file infra/.env -f infra/compose.yaml`.
 The Compose project name remains `messenger`, preserving `messenger_postgres_data`.
 
+Redis runs alongside PostgreSQL, bound to localhost on `REDIS_PORT` (default
+`6379`). `REDIS_MAXMEMORY` (default `128mb`) controls its memory limit; snapshots
+and append-only persistence are disabled. Match the port in `REDIS_URL` in
+`backend/.env`. All backend instances must share the database, JWT secret,
+`REDIS_URL`, and `REDIS_CHANNEL`. Use distinct channels for different environments:
+Redis Pub/Sub channels are not isolated by the URL's database number.
+
+With `REDIS_URL` configured, each FastAPI process owns exactly one Redis listener
+and subscription, regardless of its WebSocket count. Startup waits for the
+subscription; shutdown cancels the listener and closes its connections. The
+listener reconnects after Redis interruptions. Leave `REDIS_URL` empty to use the
+single-process in-memory bus. Redis carries transient device-scoped message,
+delivery, and read events; PostgreSQL remains authoritative. Missed notifications
+are recovered through mailbox/state sync, not Redis history.
+
+To run two instances, launch these commands in separate terminals and connect
+clients to different ports (or route them through a proxy):
+
+```powershell
+uv run --project backend uvicorn app.main:app --app-dir backend --port 8000
+uv run --project backend uvicorn app.main:app --app-dir backend --port 8001
+```
+
 Run the backend and frontend in separate terminals:
 
 ```powershell
@@ -135,8 +158,9 @@ event routing. Connections are device-scoped; a newer connection replaces the ol
 one with close code `4001`. Authentication failures use `4401`, and disallowed
 origins are rejected with `4403` before the connection is accepted.
 
-V6 uses an in-memory event bus and supports a single backend process. Socket delivery
-alone remains a best-effort attempt. After the recipient commits an envelope and
+V8 supports multiple backend processes through Redis Pub/Sub. Connection replacement
+is local to each process; delivery still rechecks device/session authorization.
+Socket delivery remains a best-effort attempt. After the recipient commits an envelope and
 cursor to IndexedDB, its explicit ACK atomically sets `delivered_at`, clears only
 that device's payload, and sets `payload_purged_at`. ACK retries preserve the first
 timestamps. Other devices retain their payload until their own ACK or the existing
@@ -173,7 +197,7 @@ client/
   web/                    # React web app, Vite/TypeScript config, public env settings
   packages/client-core/   # Shared client package; future mobile app goes in client/mobile
 backend/                  # Python app, tests, migrations, backend env settings
-infra/                    # PostgreSQL Compose configuration and container env settings
+infra/                    # PostgreSQL/Redis Compose configuration and container env settings
 package.json              # npm workspaces and repository commands
 package-lock.json         # Canonical npm lockfile
 ```
@@ -193,7 +217,7 @@ backend/app/
   auth/         # V1 authentication and device-identity feature
   chats/        # V2 user discovery and direct-chat feature
   messages/     # Device-scoped envelope persistence and mailbox APIs
-  realtime/     # V4 WebSocket protocol, connection registry, and local event bus
+  realtime/     # WebSocket protocol, connection registry, and local/Redis event buses
 ```
 
 New roadmap features should be added as sibling feature packages such as `chats/`,
@@ -219,6 +243,11 @@ npm run test:frontend
 To include PostgreSQL locking and concurrency tests, migrate an isolated test
 database, then set `TEST_DATABASE_URL` before running `npm test`. These tests are
 skipped when that variable is unset.
+
+To include real Redis multi-instance delivery checks, set `TEST_REDIS_URL` to an
+isolated Redis server before running `npm run test:backend`. Tests use a unique
+channel and never flush Redis. The Redis tests also run with an in-process fake
+broker when that variable is unset.
 
 The V6 browser check uses an installed Chromium browser with a temporary, isolated
 profile and real IndexedDB. Set `CHROMIUM_PATH` if Chrome/Edge is installed elsewhere.

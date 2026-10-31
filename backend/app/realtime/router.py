@@ -3,6 +3,9 @@ import json
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+import logging
+import os
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -78,6 +81,11 @@ async def websocket_endpoint(
 
         connection = Connection(websocket, authorize)
         await registry.register(principal.device_id, connection)
+        logging.getLogger("uvicorn.error").info(
+            "WS authenticated: pid=%s peer=%s",
+            os.getpid(),
+            websocket.client,
+        )
         await connection.send({"type": "auth.ok"})
         while registry.is_current(principal.device_id, connection):
             event = {}

@@ -22,7 +22,8 @@ from test_messages import bearer, create_authenticated_user, create_direct_chat,
 class Socket:
     """Exercise the actual ASGI route on the same loop as the test database."""
 
-    def __init__(self, token=None, origin=None):
+    def __init__(self, token=None, origin=None, application=app):
+        self.application = application
         self.token = token
         self.origin = origin or str(get_settings().frontend_origin).rstrip("/")
         self.incoming = asyncio.Queue()
@@ -37,7 +38,7 @@ class Socket:
             "client": ("127.0.0.1", 1234), "server": ("test", 80),
             "subprotocols": [],
         }
-        self.task = asyncio.create_task(app(scope, self.incoming.get, self.outgoing.put))
+        self.task = asyncio.create_task(self.application(scope, self.incoming.get, self.outgoing.put))
         await self.incoming.put({"type": "websocket.connect"})
         self.handshake = await self.frame()
         if self.token is not None and self.handshake["type"] == "websocket.accept":

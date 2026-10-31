@@ -32,3 +32,20 @@ def test_env_loading_is_independent_of_working_directory(tmp_path, monkeypatch) 
 
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///override.db")
     assert Settings().database_url == "sqlite+aiosqlite:///override.db"
+
+
+def test_redis_env_and_secret_representation(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_CHANNEL", raising=False)
+    env = tmp_path / ".env"
+    env.write_text(
+        "REDIS_URL=redis://user:private-password@localhost:6380/0\n"
+        "REDIS_CHANNEL=test:events\n",
+        encoding="utf-8",
+    )
+    settings = Settings(_env_file=env)
+    assert settings.redis_url.get_secret_value() == "redis://user:private-password@localhost:6380/0"
+    assert settings.redis_channel == "test:events"
+    assert "private-password" not in repr(settings)
+    assert Settings(_env_file=None).redis_url is None
+    assert Settings(_env_file=None, redis_url="").redis_url is None

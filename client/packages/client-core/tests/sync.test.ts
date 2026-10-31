@@ -231,6 +231,195 @@ test('ambiguous sends retain original command bytes and never automatically repl
   assert.deepEqual((await inbox.snapshot(manager.scope())).outgoing, [{ command: attempted, accepted: null }])
 })
 
+for (const committed of [true, false]) {
+  test(`lost send confirmation recovers automatically with committed=${committed} and preserves command bytes`, async () => {
+    const { manager, inbox, api } = setup()
+    await manager.activate(user)
+    const send = api.sendMessage
+    let attempted!: SendMessageRequest
+    let lookups = 0
+    let replays = 0
+    let builds = 0
+    let ids = 0
+    let ready = true
+    const realtime: RealtimeGateway = {
+      get ready() { return ready }, start() {}, stop() {}, onMessage: () => () => {}, onReady: () => () => {},
+      async sendMessage(command) {
+        attempted = structuredClone(command)
+        ready = false
+        throw new ClientError('Lost confirmation', 'delivery_unconfirmed')
+      },
+    }
+    api.findSentMessage = async id => {
+      lookups += 1
+      assert.equal(id, 'original-id')
+      return committed ? send(attempted) : null
+    }
+    api.sendMessage = async command => {
+      assert.equal(lookups, 1, 'Only a confirmed missing lookup permits replay')
+      assert.deepEqual(command, attempted)
+      replays += 1
+      return send(command)
+    }
+    const messenger = new MessengerService(api, {
+      async buildOutgoing() {
+        builds += 1
+        return [{ recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'OPAQUE', payload: 'original-bytes' }]
+      },
+      async decodeIncoming() { return 'private' },
+    }, () => { ids += 1; return 'original-id' }, realtime, manager)
+    const states: string[] = []
+    messenger.onOutgoing(messages => states.push(...messages.map(message => message.status!)))
+    const accepted = await messenger.sendText('chat', 'private')
+    assert.equal(accepted.clientMessageId, 'original-id')
+    assert.equal(replays, committed ? 0 : 1)
+    assert.equal(lookups, 1)
+    assert.equal(builds, 1)
+    assert.equal(ids, 1)
+    assert.deepEqual(states, ['pending', 'accepted'])
+    assert.deepEqual((await inbox.snapshot(manager.scope())).outgoing[0].command, attempted)
+  })
+}
+
+test('confirmation lookup retries are bounded, back off, and never replay an ambiguous result', async () => {
+  const { manager, inbox, api } = setup()
+  await manager.activate(user)
+  let lookups = 0
+  let sends = 0
+  const callbacks: Array<() => void> = []
+  const delays: number[] = []
+  api.findSentMessage = async () => { lookups += 1; throw new ClientError('Lookup unavailable', 'network_error') }
+  api.sendMessage = async () => { throw new Error('Unexpected blind replay') }
+  const messenger = new MessengerService(api, {
+    async buildOutgoing() { return [{ recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'OPAQUE', payload: 'opaque' }] },
+    async decodeIncoming() { return 'private' },
+  }, () => 'original-id', {
+    ready: true, start() {}, stop() {}, onMessage: () => () => {}, onReady: () => () => {},
+    async sendMessage() { sends += 1; throw new ClientError('Timeout', 'delivery_unconfirmed') },
+  }, manager, { schedule(callback, delay) { callbacks.push(callback); delays.push(delay); return () => {} } })
+  const sending = messenger.sendText('chat', 'private')
+  const rejected = assert.rejects(sending, error => error instanceof ClientError && error.code === 'delivery_unconfirmed')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(lookups, 1)
+  callbacks.shift()!()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(lookups, 2)
+  callbacks.shift()!()
+  await rejected
+  assert.equal(lookups, 3)
+  assert.equal(sends, 1)
+  assert.deepEqual(delays, [1000, 2000])
+  assert.equal((await inbox.snapshot(manager.scope())).outgoing[0].accepted, null)
+})
+
+test('a transient confirmation lookup failure recovers on the next check without a new send', async () => {
+  const { manager, api } = setup()
+  await manager.activate(user)
+  const accepted = await api.sendMessage({ chat_id: 'chat', client_message_id: 'original-id', envelopes: [] })
+  let lookups = 0
+  api.findSentMessage = async () => {
+    if (++lookups === 1) throw new ClientError('Lookup unavailable', 'server_error')
+    return accepted
+  }
+  api.sendMessage = async () => { throw new Error('Unexpected replay') }
+  const messenger = new MessengerService(api, {
+    async buildOutgoing() { return [{ recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'OPAQUE', payload: 'opaque' }] },
+    async decodeIncoming() { return 'private' },
+  }, () => 'original-id', {
+    ready: true, start() {}, stop() {}, onMessage: () => () => {}, onReady: () => () => {},
+    async sendMessage() { throw new ClientError('Timeout', 'delivery_unconfirmed') },
+  }, manager)
+  assert.equal((await messenger.sendText('chat', 'private')).id, accepted.id)
+  assert.equal(lookups, 2)
+})
+
+test('late acceptance updates the durable pending row and the visible message without reconnecting', async () => {
+  const { manager, inbox, api } = setup()
+  await manager.activate(user)
+  let acceptedHandler!: (message: Awaited<ReturnType<MessagingGateway['sendMessage']>>) => void
+  const accepted = await api.sendMessage({ chat_id: 'chat', client_message_id: 'original-id', envelopes: [] })
+  const realtime: RealtimeGateway = {
+    ready: true, start() {}, stop() {}, onMessage: () => () => {}, onReady: () => () => {},
+    onAccepted(handler) { acceptedHandler = handler; return () => {} },
+    async sendMessage() { throw new ClientError('Timeout', 'delivery_unconfirmed') },
+  }
+  const messenger = new MessengerService(api, {
+    async buildOutgoing() { return [{ recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'OPAQUE', payload: 'opaque' }] },
+    async decodeIncoming() { return 'private' },
+  }, () => 'original-id', realtime, manager)
+  const states: string[] = []
+  const errors: unknown[] = []
+  messenger.onOutgoing(messages => states.push(...messages.map(message => message.status!)))
+  const unsubscribe = messenger.subscribe(() => {}, error => errors.push(error))
+  await assert.rejects(messenger.sendText('chat', 'private'), /Timeout/)
+  acceptedHandler(accepted)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(states, ['pending', 'accepted'])
+  assert.equal((await inbox.snapshot(manager.scope())).outgoing[0].accepted?.id, accepted.id)
+  assert.deepEqual(errors, [])
+  unsubscribe()
+  acceptedHandler(accepted)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(states, ['pending', 'accepted'])
+})
+
+for (const operation of ['send', 'retry'] as const) {
+  test(`a late acceptance racing a missing lookup during ${operation} prevents replay of the accepted command`, async () => {
+    const { manager, inbox, api } = setup()
+    await manager.activate(user)
+    const accepted = await api.sendMessage({ chat_id: 'chat', client_message_id: 'original-id', envelopes: [] })
+    let acceptedHandler!: (message: typeof accepted) => void
+    let sends = 0
+    api.findSentMessage = async () => {
+      acceptedHandler(accepted)
+      await new Promise(resolve => setImmediate(resolve))
+      return null
+    }
+    const realtime: RealtimeGateway = {
+      ready: true, start() {}, stop() {}, onMessage: () => () => {}, onReady: () => () => {},
+      onAccepted(handler) { acceptedHandler = handler; return () => {} },
+      async sendMessage() { sends += 1; throw new ClientError('Timeout', 'delivery_unconfirmed') },
+    }
+    const messenger = new MessengerService(api, {
+      async buildOutgoing() { return [{ recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'OPAQUE', payload: 'opaque' }] },
+      async decodeIncoming() { return 'private' },
+    }, () => 'original-id', realtime, manager)
+    const unsubscribe = messenger.subscribe(() => {}, error => { throw error })
+    if (operation === 'send') assert.equal((await messenger.sendText('chat', 'private')).id, accepted.id)
+    else {
+      await inbox.putOutgoing(manager.scope(), { chat_id: 'chat', client_message_id: 'original-id', envelopes: [{
+        recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'OPAQUE', payload: 'opaque',
+      }] })
+      await messenger.retryOutgoing('original-id')
+    }
+    assert.equal(sends, operation === 'send' ? 1 : 0)
+    assert.equal((await inbox.snapshot(manager.scope())).outgoing[0].accepted?.id, accepted.id)
+    unsubscribe()
+  })
+}
+
+test('session changes during confirmation backoff stop lookup and replay', async () => {
+  const { manager, api } = setup()
+  await manager.activate(user)
+  let resume!: () => void
+  let lookups = 0
+  api.findSentMessage = async () => { lookups += 1; throw new ClientError('Unavailable', 'network_error') }
+  const messenger = new MessengerService(api, {
+    async buildOutgoing() { return [{ recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'OPAQUE', payload: 'opaque' }] },
+    async decodeIncoming() { return 'private' },
+  }, () => 'original-id', {
+    ready: true, start() {}, stop() {}, onMessage: () => () => {}, onReady: () => () => {},
+    async sendMessage() { throw new ClientError('Timeout', 'delivery_unconfirmed') },
+  }, manager, { schedule(callback) { resume = callback; return () => {} } })
+  const sending = messenger.sendText('chat', 'private')
+  const rejected = assert.rejects(sending)
+  await new Promise(resolve => setImmediate(resolve))
+  await manager.activate({ ...user, sessionId: 'replacement-session' })
+  resume()
+  await rejected
+  assert.equal(lookups, 1)
+})
+
 
 test('V6 ACK waits for durable commit and retries after crash without losing the local payload', async () => {
   for (const delivery of ['sync', 'realtime'] as const) {
@@ -593,6 +782,62 @@ test('a receipt racing acceptance publication updates only delivery metadata aft
   assert.equal(states.length, 3)
 })
 
+
+for (const operation of ['send', 'retry', 'recover'] as const) {
+  test(`sent metadata racing ${operation} waits for outgoing publication`, async () => {
+    const { manager, inbox, api } = setup()
+    await manager.activate(user)
+    const command: SendMessageRequest = { chat_id: 'chat', client_message_id: 'race-id', envelopes: [{
+      recipient_device_id: 'alice-device', protocol_version: 0, envelope_type: 'OPAQUE', payload: 'original',
+    }] }
+    const destination = { ...envelope(1), recipient_device_id: 'alice-device', message_id: 'accepted' }
+    const accepted = { ...await api.sendMessage(command), chatSeq: 7, envelopes: [destination] }
+    const metadata = { ...accepted, envelopes: [{ ...destination, payload: null, delivered_at: user.createdAt }] }
+    let storedMetadata: typeof metadata | null = null
+    // A receipt without a matching local acceptance falls back to sent metadata.
+    inbox.applyDeliveryReceipt = async () => null
+    inbox.getSentMetadata = async () => storedMetadata
+    inbox.mergeSentMetadata = async () => { storedMetadata = metadata; return metadata }
+    let receiptStarted = false
+    api.getSentMessages = async () => ({ messages: receiptStarted ? [metadata] : [], hasMore: false, nextMessageId: null })
+    api.findSentMessage = async () => accepted
+    if (operation !== 'send') await inbox.putOutgoing(manager.scope(), command)
+    let delivered!: (value: MailboxEnvelope) => void
+    const realtime: RealtimeGateway = {
+      ready: true, start() {}, stop() {}, onMessage: () => () => {}, onReady: () => () => {},
+      onDelivered(handler) { delivered = handler; return () => {} },
+      async sendMessage() { return accepted },
+    }
+    let decodes = 0
+    const messenger = new MessengerService(api, {
+      async buildOutgoing() { return command.envelopes },
+      async decodeIncoming() {
+        if (++decodes === (operation === 'send' ? 2 : 1)) {
+          receiptStarted = true
+          delivered(metadata.envelopes[0])
+          await new Promise(resolve => setImmediate(resolve))
+          assert.deepEqual(states, operation === 'send' ? ['pending'] : [])
+        }
+        return 'private'
+      },
+    }, () => 'race-id', realtime, manager)
+    const states: string[] = []
+    const errors: unknown[] = []
+    messenger.onOutgoing(messages => states.push(...messages.map(item => item.status!)))
+    messenger.onDelivery(update => {
+      assert.equal('content' in update, false)
+      assert.equal(update.chatSeq, 7)
+      states.push(update.status!)
+    })
+    const unsubscribe = messenger.subscribe(() => {}, error => errors.push(error))
+    if (operation === 'send') await messenger.sendText('chat', 'private')
+    else if (operation === 'retry') await messenger.retryOutgoing('race-id')
+    else await messenger.loadMailbox()
+    unsubscribe()
+    assert.deepEqual(errors, [])
+    assert.deepEqual(states, operation === 'send' ? ['pending', 'accepted', 'delivered'] : ['accepted', 'delivered'])
+  })
+}
 
 test('metadata restoration never reads or decodes history; opening reads exactly one chat page', async () => {
   const { manager, inbox, api } = setup()

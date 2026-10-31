@@ -27,6 +27,8 @@ export class WebSocketManager implements RealtimeGateway {
   private unsubscribeSession: (() => void) | null = null
   private messageHandlers = new Set<(envelope: MailboxEnvelope) => void>()
   private deliveredHandlers = new Set<(envelope: MessageEnvelope) => void>()
+  private acceptedHandlers = new Set<(message: SentMessage) => void>()
+  private unconfirmed = new Map<string, { chatId: string; clientMessageId: string }>()
   private pendingAck = new Map<string, PendingRequest<MessageEnvelope>>()
   private readHandlers = new Set<(cursor: ChatReadCursor) => void>()
   private pendingRead = new Map<string, PendingRequest<ChatReadCursor>>()
@@ -81,6 +83,11 @@ export class WebSocketManager implements RealtimeGateway {
     return () => { this.deliveredHandlers.delete(handler) }
   }
 
+  onAccepted(handler: (message: SentMessage) => void): () => void {
+    this.acceptedHandlers.add(handler)
+    return () => { this.acceptedHandlers.delete(handler) }
+  }
+
   onReadCursor(handler: (cursor: ChatReadCursor) => void): () => void {
     this.readHandlers.add(handler)
     return () => { this.readHandlers.delete(handler) }
@@ -108,6 +115,11 @@ export class WebSocketManager implements RealtimeGateway {
       requestId => ({ type: 'message.send', request_id: requestId, data: command }),
       () => new ApiError('Message confirmation timed out. Delivery is unconfirmed.', 0, null, 'delivery_unconfirmed'),
       () => new ApiError('Connection lost. Message delivery is unconfirmed.', 0, null, 'delivery_unconfirmed'),
+      requestId => {
+        this.unconfirmed.set(requestId, { chatId: command.chat_id, clientMessageId: command.client_message_id })
+        // Retain identifiers only; old confirmations remain recoverable by HTTP.
+        if (this.unconfirmed.size > 256) this.unconfirmed.delete(this.unconfirmed.keys().next().value!)
+      },
     )
   }
 
@@ -125,11 +137,13 @@ export class WebSocketManager implements RealtimeGateway {
     createEvent: (requestId: string) => ClientEvent,
     timeoutError: () => ApiError,
     connectionLostError: () => ApiError,
+    onTimeout?: (requestId: string) => void,
   ): Promise<T> {
     if (!this.ready) return Promise.reject(new ApiError('Real-time connection is unavailable.', 0))
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
+        onTimeout?.(requestId)
         this.takePending(requests, requestId)?.reject(timeoutError())
       }, 15_000)
       requests.set(requestId, { resolve, reject, timer })
@@ -218,9 +232,17 @@ export class WebSocketManager implements RealtimeGateway {
         this.takePending(this.pendingSync, frame.request_id)?.resolve(frame.data)
         return
 
-      case 'message.accepted':
-        this.takePending(this.pending, frame.request_id)?.resolve(frame.data)
+      case 'message.accepted': {
+        const pending = this.takePending(this.pending, frame.request_id)
+        if (pending) pending.resolve(frame.data)
+        else {
+          const command = this.unconfirmed.get(frame.request_id)
+          if (command?.clientMessageId !== frame.data.clientMessageId || command.chatId !== frame.data.chatId) return
+          this.unconfirmed.delete(frame.request_id)
+          for (const handler of this.acceptedHandlers) handler(frame.data)
+        }
         return
+      }
 
       case 'error': {
         const pending = this.takePending(this.pendingRead, frame.request_id)
@@ -258,6 +280,7 @@ export class WebSocketManager implements RealtimeGateway {
   }
 
   private rejectPending(): void {
+    this.unconfirmed.clear()
     for (const pending of this.pendingRead.values()) {
       window.clearTimeout(pending.timer)
       pending.reject(new ApiError('Connection lost during read confirmation.', 0))

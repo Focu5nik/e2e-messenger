@@ -12,6 +12,7 @@ import { ApiError } from './errors.ts'
 const API_URL = (import.meta.env?.VITE_API_URL ?? 'http://localhost:8000').replace(/\/$/, '')
 const REFRESH_LOCK_NAME = 'secure-messenger:auth-refresh'
 const LEGACY_REFRESH_TOKEN_STORAGE_KEY = 'messenger.refresh-token'
+const REQUEST_TIMEOUT_MS = 15_000
 
 function clearLegacyRefreshTokenStorage(): void {
   try {
@@ -34,11 +35,29 @@ async function parseError(response: Response, login: boolean): Promise<ApiError>
   return new ApiError(message, response.status, code, login && response.status === 401 ? 'invalid_credentials' : undefined)
 }
 
-async function fetchApi(path: string, init: RequestInit): Promise<Response> {
+async function fetchApi<T>(path: string, init: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+  const controller = new AbortController()
+  let timer: number | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = window.setTimeout(() => {
+      reject(new ApiError('Request timed out. Check your connection and try again.', 0))
+      controller.abort()
+    }, REQUEST_TIMEOUT_MS)
+  })
   try {
-    return await fetch(`${API_URL}${path}`, init)
-  } catch {
-    throw new ApiError('Cannot reach the server. Check your connection and try again.', 0)
+    const operation = async () => {
+      let response: Response
+      try {
+        response = await fetch(`${API_URL}${path}`, { ...init, signal: controller.signal })
+      } catch {
+        throw new ApiError('Cannot reach the server. Check your connection and try again.', 0)
+      }
+      return read(response)
+    }
+    // Cover response bodies too: receiving headers does not finish a request.
+    return await Promise.race([operation(), timeout])
+  } finally {
+    window.clearTimeout(timer)
   }
 }
 
@@ -211,12 +230,10 @@ export class ApiClient implements SessionGateway, AccountGateway, ChatGateway, M
   }
 
   private async publicRequest<T>(map: (value: unknown) => T, path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetchApi(path, {
+    return fetchApi(path, {
       ...init,
       headers: this.headers(init.headers, false, init.body !== undefined),
-    })
-
-    return this.readResponse(response, map, path === '/auth/login')
+    }, response => this.readResponse(response, map, path === '/auth/login'))
   }
 
   private async authenticatedRequest<T>(
@@ -229,21 +246,22 @@ export class ApiClient implements SessionGateway, AccountGateway, ChatGateway, M
       await this.refreshAccessToken()
     }
 
-    let response = await fetchApi(path, {
+    const request = () => fetchApi(path, {
       ...init,
       headers: this.headers(init.headers, true, init.body !== undefined),
-    })
+    }, response => this.readResponse(response, map))
 
-    if (response.status === 401 && retryAfterRefresh) {
-      await this.refreshAccessToken()
-      response = await fetchApi(path, {
-        ...init,
-        headers: this.headers(init.headers, true, init.body !== undefined),
-      })
+    try {
+      return await request()
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 401) throw error
+      if (retryAfterRefresh) {
+        await this.refreshAccessToken()
+        return this.authenticatedRequest(map, path, init, false)
+      }
+      this.clearSession(true)
+      throw error
     }
-
-    if (response.status === 401) this.clearSession(true)
-    return this.readResponse(response, map)
   }
 
   private headers(headers: HeadersInit | undefined, authenticated: boolean, hasBody: boolean): Headers {
@@ -290,9 +308,27 @@ export class ApiClient implements SessionGateway, AccountGateway, ChatGateway, M
     return this.refreshPromise
   }
 
-  private withRefreshCookieLock<T>(operation: () => Promise<T>): Promise<T> {
+  private async withRefreshCookieLock<T>(operation: () => Promise<T>): Promise<T> {
     const lockManager = typeof navigator === 'undefined' ? undefined : navigator.locks
-    return lockManager ? lockManager.request(REFRESH_LOCK_NAME, operation) : operation()
+    if (!lockManager) return operation()
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      controller.abort(new ApiError('Session refresh is busy. Please try again.', 0))
+    }, REQUEST_TIMEOUT_MS)
+    try {
+      return await lockManager.request(REFRESH_LOCK_NAME, { signal: controller.signal }, () => {
+        // Once acquired, the HTTP request has its own deadline. Never release a
+        // granted cookie lock while its request can still rotate credentials.
+        window.clearTimeout(timer)
+        controller.signal.throwIfAborted()
+        return operation()
+      })
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason
+      throw error
+    } finally {
+      window.clearTimeout(timer)
+    }
   }
 
   private acceptTokens(tokens: TokenResponse): void {

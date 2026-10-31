@@ -40,6 +40,8 @@ export interface MessagingGateway {
 }
 
 export interface RealtimeGateway {
+  // Acceptance received after the original send request timed out.
+  onAccepted?(handler: (message: SentMessage) => void): () => void
   advanceReadCursor?(chatId: string, lastReadSeq: number): Promise<ChatReadCursor>
   onReadCursor?(handler: (cursor: ChatReadCursor) => void): () => void
   acknowledgeEnvelope?(envelopeId: string): Promise<MessageEnvelope>

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
-import { ClientError } from '@secure-messenger/client-core'
+import test, { type TestContext } from 'node:test'
+import { ClientError, createChatStore, MessengerService, type DirectChat } from '@secure-messenger/client-core'
 import { ApiError } from '../src/shared/api/errors.ts'
 import { currentUserDto, deviceDto, envelopeDto, sentMessageDto, timestamp, tokensDto, userDto } from './apiFixtures.ts'
 
@@ -30,7 +30,7 @@ function installLockManager(): void {
     configurable: true,
     value: {
       locks: {
-        async request<T>(name: string, operation: () => Promise<T>): Promise<T> {
+        async request<T>(name: string, _options: LockOptions, operation: () => Promise<T>): Promise<T> {
           lockNames.push(name)
           return operation()
         },
@@ -575,7 +575,7 @@ test('concurrent clients serialize cookie refreshes with Web Locks and coalesce 
     configurable: true,
     value: {
       locks: {
-        request<T>(name: string, operation: () => Promise<T>): Promise<T> {
+        request<T>(name: string, _options: LockOptions, operation: () => Promise<T>): Promise<T> {
           names.push(name)
           const result = tail.then(operation)
           tail = result.then(() => undefined, () => undefined)
@@ -651,4 +651,134 @@ test('scheduled refresh rotates memory tokens, retries transient failures, and c
   assert.equal(expired, 0)
   await client.logout()
   assert.equal(timers.size, 0)
+})
+
+function requestTimers(t: TestContext) {
+  const timers = new Map<number, { callback: () => void; delay: number | undefined }>()
+  let nextTimer = 0
+  t.mock.method(window, 'setTimeout', (handler: TimerHandler, delay?: number) => {
+    const id = ++nextTimer
+    timers.set(id, { callback: () => (handler as () => void)(), delay })
+    return id
+  })
+  t.mock.method(window, 'clearTimeout', (id: number) => { timers.delete(id) })
+  return {
+    timers,
+    expire() {
+      const entry = [...timers].find(([, timer]) => timer.delay === 15_000)
+      assert.ok(entry, 'A pending request must have a deadline')
+      timers.delete(entry[0])
+      entry[1].callback()
+    },
+  }
+}
+
+for (const stalled of ['headers', 'body'] as const) {
+  test(`stalled destination ${stalled} aborts and releases the sending form before any socket send`, async (t) => {
+    removeLockManager()
+    const { timers, expire } = requestTimers(t)
+    globalThis.fetch = async () => tokenResponse('access')
+    const client = new ApiClient()
+    await client.login('alice', 'password', { id: 'device', name: 'Browser' })
+    let signal: AbortSignal | null | undefined
+    globalThis.fetch = async (_input, init) => {
+      signal = init?.signal
+      if (stalled === 'headers') return new Promise<Response>(() => {})
+      return new Response(new ReadableStream<Uint8Array>({ start() {} }))
+    }
+    let sends = 0
+    const chat: DirectChat = { id: 'chat-1', type: 'DIRECT', createdAt: timestamp,
+      otherUser: { id: 'peer', username: 'peer', status: 'active', createdAt: timestamp } }
+    const messenger = new MessengerService(client, {
+      async buildOutgoing() { return [] }, async decodeIncoming() { return 'unused' },
+    }, () => 'client-1', {
+      ready: true, start() {}, stop() {}, onMessage: () => () => {}, onReady: () => () => {},
+      async sendMessage(command) {
+        sends += 1
+        return { id: 'message-1', chatId: command.chat_id, clientMessageId: command.client_message_id,
+          senderUserId: 'user-1', senderDeviceId: 'device', createdAt: timestamp, envelopes: [] }
+      },
+    })
+    const store = createChatStore({
+      chats: { async getChats() { return [chat] }, async getChat() { return chat },
+        async searchUsers() { return [] }, async createDirectChat() { return chat } },
+      messenger: {
+        async loadMailbox() { return { messages: [], envelopes: [], nextSeq: 0, tombstoneCount: 0 } },
+        subscribe: () => () => {}, onReady: () => () => {},
+        sendText: (...args) => messenger.sendText(...args),
+      },
+      preferences: { async restore() { return null }, async select() {} },
+    })
+    await store.getState().start('user-1')
+    await store.getState().selectChat(chat)
+    const sending = store.getState().sendText('synthetic test')
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(store.getState().sending, true)
+    assert.equal(sends, 0)
+    expire()
+    assert.equal(await sending, false)
+    assert.equal(signal?.aborted, true)
+    assert.equal(store.getState().sending, false)
+    assert.match(store.getState().sendError!, /timed out/)
+    assert.equal(sends, 0)
+    globalThis.fetch = async () => Response.json([{ id: 'peer-device', user_id: 'peer', protocol_version: 0 }])
+    assert.equal(await store.getState().sendText('synthetic test'), true)
+    assert.equal(sends, 1)
+    assert.equal([...timers.values()].some(timer => timer.delay === 15_000), false)
+    store.getState().dispose()
+  })
+}
+
+test('stalled refresh aborts, releases coalesced callers, and ignores its late result', async (t) => {
+  removeLockManager()
+  const { expire } = requestTimers(t)
+  const client = new ApiClient()
+  let release!: (response: Response) => void
+  let signal: AbortSignal | null | undefined
+  globalThis.fetch = async (_input, init) => {
+    signal = init?.signal
+    return new Promise<Response>(resolve => { release = resolve })
+  }
+  let expired = 0
+  client.onSessionExpired(() => { expired += 1 })
+  const first = client.getAccessToken(true)
+  const second = client.getAccessToken(true)
+  expire()
+  await Promise.all([assert.rejects(first, /timed out/), assert.rejects(second, /timed out/)])
+  assert.equal(signal?.aborted, true)
+  assert.equal(expired, 0)
+  release(tokenResponse('stale-access'))
+  await new Promise(resolve => setImmediate(resolve))
+  globalThis.fetch = async () => tokenResponse('fresh-access')
+  assert.equal(await client.getAccessToken(), 'fresh-access')
+})
+
+test('refresh lock wait is cancelled and cannot issue a late cookie request', async (t) => {
+  const { expire } = requestTimers(t)
+  let callback!: () => Promise<unknown>
+  let signal!: AbortSignal
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks: {
+      request(_name: string, options: LockOptions, operation: () => Promise<unknown>) {
+        signal = options.signal!
+        callback = operation
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+      },
+    } },
+  })
+  let requests = 0
+  globalThis.fetch = async () => { requests += 1; return tokenResponse('fresh-access') }
+  const client = new ApiClient()
+  const refreshing = client.getAccessToken(true)
+  expire()
+  await assert.rejects(refreshing, /refresh is busy/)
+  assert.equal(signal.aborted, true)
+  assert.throws(callback, /refresh is busy/)
+  assert.equal(requests, 0)
+  installLockManager()
+  assert.equal(await client.getAccessToken(true), 'fresh-access')
+  assert.equal(requests, 1)
 })

@@ -279,6 +279,42 @@ test('a synchronous socket send failure rejects as unconfirmed and clears its co
   manager.stop()
 })
 
+test('late acceptance is correlated after timeout, emitted once, and discarded across sessions', async () => {
+  const { manager, sockets, runTimer } = setup()
+  const accepted: string[] = []
+  const unsubscribe = manager.onAccepted(message => accepted.push(message.id))
+  manager.start()
+  await Promise.resolve()
+  const socket = sockets[0]
+  socket.open()
+  socket.receive({ type: 'auth.ok' })
+  const sending = manager.sendMessage(command)
+  const { request_id } = JSON.parse(socket.sent[1])
+  runTimer(15_000)
+  await assert.rejects(sending, /timed out/)
+  socket.receive({ type: 'message.accepted', request_id: 'unknown', data: sentMessageDto })
+  socket.receive({ type: 'message.accepted', request_id, data: { ...sentMessageDto, client_message_id: 'another-id' } })
+  socket.receive({ type: 'message.accepted', request_id, data: { ...sentMessageDto, chat_id: 'another-chat' } })
+  assert.deepEqual(accepted, [])
+  socket.receive({ type: 'message.accepted', request_id, data: sentMessageDto })
+  socket.receive({ type: 'message.accepted', request_id, data: sentMessageDto })
+  assert.deepEqual(accepted, ['message-1'])
+  const next = manager.sendMessage(command)
+  const nextId = JSON.parse(socket.sent[2]).request_id
+  runTimer(15_000)
+  await assert.rejects(next)
+  manager.stop()
+  manager.start()
+  await Promise.resolve()
+  sockets[1].open()
+  sockets[1].receive({ type: 'auth.ok' })
+  socket.receive({ type: 'message.accepted', request_id: nextId, data: sentMessageDto })
+  sockets[1].receive({ type: 'message.accepted', request_id: nextId, data: sentMessageDto })
+  assert.deepEqual(accepted, ['message-1'])
+  unsubscribe()
+  manager.stop()
+})
+
 
 test('V6 ACK serialization correlates recipient responses separately from sender delivery events', async () => {
   const { manager, sockets } = setup()

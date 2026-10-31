@@ -1,14 +1,13 @@
-import { ClientError } from '../domain/errors.ts'
 import type { ChatReadState, DirectChat, DisplayMessage, MessageDeliveryUpdate, ReceivedMessage, SentMessage } from '../domain/models.ts'
 import type { ChatHistoryCursor, InboxScope, InboxSnapshot, OutgoingCommand } from '../ports/durableInbox.ts'
-import type { MailboxEnvelope, MessageEnvelope, SendMessageRequest } from '../protocol/contracts.ts'
+import type { MailboxEnvelope } from '../protocol/contracts.ts'
 import type { MessagingGateway, RealtimeGateway } from '../ports/gateways.ts'
+import { deliveryState, OutgoingManager } from './outgoingManager.ts'
 import { ReadCursorManager } from './readCursorManager.ts'
 import type { IdGenerator, Scheduler } from '../ports/platform.ts'
 import type { MessageCodec } from './messageCodec.ts'
 import type { SyncManager } from './syncManager.ts'
 
-const DELIVERY_TARGETS_CHANGED = 'delivery_targets_changed'
 const MAILBOX_PAGE_SIZE = 100
 
 export type MailboxLoadResult = {
@@ -21,7 +20,7 @@ export type MailboxLoadResult = {
 export class MessengerService {
   private readonly api: MessagingGateway
   private readonly codec: MessageCodec<string>
-  private readonly createClientMessageId: IdGenerator
+  private readonly outgoing: OutgoingManager
   private readonly realtime?: RealtimeGateway
   private readonly sync?: SyncManager
   private readonly reads?: ReadCursorManager
@@ -35,10 +34,6 @@ export class MessengerService {
   setHistoryChats(chatIds: string[]): void { this.historyChats = new Set(chatIds) }
 
   private outgoingHandlers = new Set<(messages: DisplayMessage[]) => void>()
-  private recovering: Promise<void> | null = null
-  private inFlight = new Set<string>()
-  private pendingDeliveries = new Map<string, { scope: InboxScope; update: MessageDeliveryUpdate }>()
-  private deliveryHandlers = new Set<(update: MessageDeliveryUpdate) => void>()
 
   constructor(
     api: MessagingGateway,
@@ -50,69 +45,15 @@ export class MessengerService {
   ) {
     this.api = api
     this.codec = codec
-    this.createClientMessageId = createClientMessageId
     this.realtime = realtime
     this.sync = sync
+    this.outgoing = new OutgoingManager(api, codec, createClientMessageId,
+      (commands, scope) => this.publishOutgoing(commands, scope), realtime, sync, scheduler)
     if (sync) this.reads = new ReadCursorManager(sync, api, realtime, scheduler)
   }
 
-  async sendText(chatId: string, content: string, clientMessageId?: string): Promise<SentMessage> {
-    const stableClientMessageId = clientMessageId ?? this.createClientMessageId()
-    const scope = this.sync?.scope()
-    if (scope && clientMessageId) {
-      const existing = await this.sync!.inbox.getOutgoing(scope, clientMessageId)
-      if (this.sync!.scope() !== scope) throw new Error('Message session changed.')
-      if (existing) {
-        if (existing.command.chat_id !== chatId) throw new Error('Outgoing command belongs to another chat.')
-        return this.recoverCommand(existing)
-      }
-    }
-
-    return this.sendNewText(chatId, content, stableClientMessageId)
-  }
-
-  private async sendNewText(chatId: string, content: string, stableClientMessageId: string, replaceRejected = false, changes?: Map<string, OutgoingCommand>): Promise<SentMessage> {
-    const scope = this.sync?.scope()
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const destinationDevices = await this.api.getDestinationDevices(chatId)
-      if (destinationDevices.length === 0 || (scope && destinationDevices.every(device => device.userId === scope.userId))) {
-        throw new ClientError(
-          'This person has no available devices to receive messages. Try again after they register a device.',
-          'no_recipient_devices',
-        )
-      }
-      const envelopes = await this.codec.buildOutgoing(content, destinationDevices)
-
-      try {
-        const command = {
-          chat_id: chatId,
-          client_message_id: stableClientMessageId,
-          envelopes,
-        }
-        this.inFlight.add(stableClientMessageId)
-        if (scope) {
-          // Keep a retryable durable row until fresh envelopes have been built.
-          const outgoing = await this.sync!.inbox.putOutgoing(scope, command, replaceRejected)
-          await this.outgoingChanged(outgoing, scope, changes)
-        }
-        if (scope && this.sync!.scope() !== scope) throw new Error('Message session changed.')
-        const accepted = await this.sendCommand(command)
-        if (scope) {
-          const outgoing = await this.sync!.inbox.acceptOutgoing(scope, accepted)
-          await this.outgoingChanged(outgoing, scope, changes)
-        }
-        return accepted
-      } catch (error) {
-        if (!this.isDeliveryTargetsChanged(error)) throw error
-        replaceRejected = true
-        if (attempt === 1) throw error
-      } finally {
-        this.inFlight.delete(stableClientMessageId)
-        this.publishDeliveries()
-      }
-    }
-
-    throw new Error('Message delivery failed.')
+  sendText(chatId: string, content: string, clientMessageId?: string): Promise<SentMessage> {
+    return this.outgoing.sendText(chatId, content, clientMessageId)
   }
 
   subscribe(
@@ -151,32 +92,10 @@ export class MessengerService {
       if (messages.length) onMessage(messages)
     }
 
-    const handleDeliveryReceipt = async (receipt: MessageEnvelope): Promise<void> => {
-      if (!this.sync) return
-      const scope = this.sync.scope()
-      const outgoing = await this.sync.inbox.applyDeliveryReceipt(scope, receipt)
-      if (!active || this.sync.scope() !== scope) return
-      let accepted = outgoing?.accepted ?? await this.sync.inbox.getSentMetadata?.(scope, receipt.message_id)
-      if (!accepted && this.api.getSentMessages) {
-        await this.recoverSentMetadata(scope)
-        accepted = await this.sync.inbox.getSentMetadata?.(scope, receipt.message_id)
-      }
-      if (!accepted || !active || this.sync.scope() !== scope) return
-      const update: MessageDeliveryUpdate = {
-        messageId: accepted.id,
-        chatId: accepted.chatId,
-        ...this.deliveryState(accepted),
-      }
-      this.pendingDeliveries.set(update.messageId, { scope, update })
-      this.publishDeliveries()
-    }
-
     const unsubscribe = this.realtime?.onMessage(envelope => {
       void handleIncomingEnvelope(envelope).catch(reportError)
     })
-    const unsubscribeDelivered = this.realtime?.onDelivered?.(receipt => {
-      void handleDeliveryReceipt(receipt).catch(reportError)
-    })
+    const unsubscribeDelivered = this.outgoing.subscribe(reportError)
 
     const unsubscribeRead = this.realtime?.onReadCursor?.(cursor => {
       void this.reads?.merge(cursor).catch(reportError)
@@ -187,7 +106,7 @@ export class MessengerService {
       this.reads?.stop()
       unsubscribeRead?.()
       unsubscribe?.()
-      unsubscribeDelivered?.()
+      unsubscribeDelivered()
     }
   }
 
@@ -199,24 +118,6 @@ export class MessengerService {
     return this.reads?.advance(chatId, seq) ?? Promise.resolve()
   }
 
-  private async recoverSentMetadata(scope: InboxScope): Promise<void> {
-    if (!this.sync?.inbox.mergeSentMetadata || !this.api.getSentMessages) return
-    let after: string | undefined
-    while (true) {
-      const page = await this.api.getSentMessages(after, 100, true)
-      if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-      for (const message of page.messages) {
-        const accepted = await this.sync.inbox.mergeSentMetadata(scope, message)
-        if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-        const update = { messageId: accepted.id, chatId: accepted.chatId, chatSeq: accepted.chatSeq, ...this.deliveryState(accepted) }
-        for (const handler of this.deliveryHandlers) handler(update)
-      }
-      if (!page.hasMore) break
-      if (!page.nextMessageId || page.nextMessageId === after) throw new Error('Sent metadata paging did not advance.')
-      after = page.nextMessageId
-    }
-  }
-
   onReady(handler: () => void): () => void {
     return this.realtime?.onReady(handler) ?? (() => {})
   }
@@ -226,13 +127,13 @@ export class MessengerService {
       const scope = this.sync.scope()
       const changes = await this.sync.synchronize()
       if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-      await this.recoverSentMetadata(scope)
+      await this.outgoing.recoverSentMetadata(scope)
       if (this.sync.scope() !== scope) throw new Error('Message session changed.')
       // Fetch read cursors after metadata: messages excluded by a concurrent read
       // must still acquire their final status, even on a newly registered device.
       await this.reads?.synchronize()
       if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-      await this.recoverOutgoing()
+      await this.outgoing.recoverOutgoing()
       if (this.sync.scope() !== scope) throw new Error('Message session changed.')
       const decoded = await this.decodeSnapshot({ ...changes, outgoing: [], chats: [] })
       if (this.sync.scope() !== scope) throw new Error('Message session changed.')
@@ -290,19 +191,8 @@ export class MessengerService {
     if (this.sync) await this.sync.inbox.saveChats(this.sync.scope(), chats)
   }
 
-  private publishDeliveries(): void {
-    // Acceptance must reach subscribers before a racing metadata-only receipt.
-    if (this.inFlight.size || this.recovering) return
-    for (const [id, { scope, update }] of this.pendingDeliveries) {
-      this.pendingDeliveries.delete(id)
-      try { if (this.sync?.scope() !== scope) continue } catch { continue }
-      for (const handler of this.deliveryHandlers) handler(update)
-    }
-  }
-
   onDelivery(handler: (update: MessageDeliveryUpdate) => void): () => void {
-    this.deliveryHandlers.add(handler)
-    return () => { this.deliveryHandlers.delete(handler) }
+    return this.outgoing.onDelivery(handler)
   }
 
   onOutgoing(handler: (messages: DisplayMessage[]) => void): () => void {
@@ -310,85 +200,8 @@ export class MessengerService {
     return () => { this.outgoingHandlers.delete(handler) }
   }
 
-  async retryOutgoing(clientMessageId: string): Promise<void> {
-    if (!this.sync) return
-    const scope = this.sync.scope()
-    const outgoing = await this.sync.inbox.getOutgoing(scope, clientMessageId)
-    if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-    if (outgoing) await this.recoverCommand(outgoing)
-  }
-
-  private async recoverOutgoing(): Promise<void> {
-    if (!this.sync || !this.api.findSentMessage) return
-    if (this.recovering) return this.recovering
-    const scope = this.sync.scope()
-    const operation = async () => {
-      const changes = new Map<string, OutgoingCommand>()
-      const readStates = await this.sync!.inbox.readChatReadStates?.(scope) ?? []
-      const peerReads = new Map(readStates.map(state => [state.chatId, state.peerLastReadSeq]))
-      for (const outgoing of await this.sync!.inbox.getOutgoingToRecover(scope)) {
-        if (this.sync!.scope() !== scope) throw new Error('Message session changed.')
-        if (this.inFlight.has(outgoing.command.client_message_id)) continue
-        if (outgoing.accepted?.chatSeq && outgoing.accepted.chatSeq <= (peerReads.get(outgoing.command.chat_id) ?? 0)) continue
-        if (outgoing.accepted?.envelopes.length && outgoing.accepted.envelopes.every(item => item.delivered_at)) continue
-        try { await this.recoverCommand(outgoing, changes) }
-        catch {
-          // One unconfirmed command must not block other messages or inbox display.
-          if (this.sync!.scope() !== scope) throw new Error('Message session changed.')
-        }
-      }
-      await this.publishOutgoing([...changes.values()], scope)
-    }
-    this.recovering = operation().finally(() => { this.recovering = null; this.publishDeliveries() })
-    return this.recovering
-  }
-
-  private async recoverCommand(outgoing: OutgoingCommand, changes?: Map<string, OutgoingCommand>): Promise<SentMessage> {
-    if (!this.sync || !this.api.findSentMessage) throw new ClientError('Reconnect to confirm message delivery.', 'delivery_unconfirmed')
-    const scope = this.sync.scope()
-    const command = outgoing.command
-    if (this.inFlight.has(command.client_message_id)) throw new ClientError('Message confirmation is already in progress.', 'delivery_unconfirmed')
-    this.inFlight.add(command.client_message_id)
-    try {
-      const found = await this.api.findSentMessage(command.client_message_id)
-      if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-      let accepted: SentMessage
-      if (found !== null) {
-        accepted = found
-      } else if (outgoing.accepted) {
-        // A formerly accepted message must never become a new send.
-        accepted = outgoing.accepted
-      } else {
-        // Only an authoritative missing result permits replay, with the exact durable bytes.
-        accepted = await this.sendCommand(command)
-      }
-      const updated = await this.sync.inbox.acceptOutgoing(scope, accepted)
-      if (JSON.stringify(updated.accepted) !== JSON.stringify(outgoing.accepted)) {
-        await this.outgoingChanged(updated, scope, changes)
-      }
-      return accepted
-    } catch (error) {
-      if (!outgoing.accepted && this.isDeliveryTargetsChanged(error)) {
-        if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-        const content = await this.codec.decodeIncoming(command.envelopes[0])
-        if (this.sync.scope() !== scope) throw new Error('Message session changed.')
-        return await this.sendNewText(command.chat_id, content, command.client_message_id, true, changes)
-      }
-      throw error
-    } finally {
-      this.inFlight.delete(command.client_message_id)
-      this.publishDeliveries()
-    }
-  }
-
-  private sendCommand(command: SendMessageRequest): Promise<SentMessage> {
-    if (this.realtime?.ready) return this.realtime.sendMessage(command)
-    return this.api.sendMessage(command)
-  }
-
-  private async outgoingChanged(outgoing: OutgoingCommand, scope: InboxScope, changes?: Map<string, OutgoingCommand>): Promise<void> {
-    if (changes) changes.set(outgoing.command.client_message_id, outgoing)
-    else await this.publishOutgoing([outgoing], scope)
+  retryOutgoing(clientMessageId: string): Promise<void> {
+    return this.outgoing.retryOutgoing(clientMessageId)
   }
 
   private async publishOutgoing(outgoingCommands: OutgoingCommand[], scope: InboxScope): Promise<void> {
@@ -414,14 +227,7 @@ export class MessengerService {
       chatId: command.chat_id, chatSeq: accepted?.chatSeq, senderUserId: scope.userId,
       createdAt: createdAt ?? accepted?.createdAt ?? '',
       content: await this.codec.decodeIncoming(command.envelopes[0]),
-      ...this.deliveryState(accepted),
-    }
-  }
-
-  private deliveryState(accepted: SentMessage | null): Pick<DisplayMessage, 'status' | 'deliveries'> {
-    return {
-      status: !accepted ? 'pending' : accepted.envelopes.some(item => item.recipient_user_id !== accepted.senderUserId && item.delivered_at) ? 'delivered' : 'accepted',
-      deliveries: accepted?.envelopes.map(item => ({ deviceId: item.recipient_device_id, deliveredAt: item.delivered_at })),
+      ...deliveryState(accepted),
     }
   }
 
@@ -454,7 +260,7 @@ export class MessengerService {
     const sent = scope && envelope.sender_user_id === scope.userId
       ? await this.sync!.inbox.getSentMetadata?.(scope, envelope.message_id) : null
     return {
-      ...(scope && envelope.sender_user_id === scope.userId ? this.deliveryState(sent ?? null) : {}),
+      ...(scope && envelope.sender_user_id === scope.userId ? deliveryState(sent ?? null) : {}),
       ...(scope && envelope.sender_user_id === scope.userId && !sent ? { status: 'accepted' as const } : {}),
       envelopeId: envelope.id,
       historyId: `envelope:${envelope.id}`,
@@ -468,10 +274,5 @@ export class MessengerService {
       content,
       createdAt: envelope.message_created_at,
     }
-  }
-
-  private isDeliveryTargetsChanged(error: unknown): boolean {
-    return error instanceof ClientError
-      && error.code === DELIVERY_TARGETS_CHANGED
   }
 }
